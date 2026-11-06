@@ -64,6 +64,8 @@ export type EvidenceResult = {
   decision: string;
   decisionRecordId: string;
   status: string;
+  createdAtBlock: bigint | null;
+  createdAtTimestamp: bigint | null;
   txHash?: Hex | null;
   created?: boolean;
 };
@@ -78,7 +80,7 @@ export async function findEvidence(
   termsHash: Hex,
 ): Promise<EvidenceResult | null> {
   const rows = await arkivPublicClient
-    .select({ $key: true })
+    .select({ $key: true, $createdAt: true })
     .from(transactionEvidenceSchema)
     .where(and(eq("transactionId", transactionId), eq("termsHash", termsHash)))
     .fetch();
@@ -92,6 +94,10 @@ export async function findEvidence(
   ) {
     throw new Error("Arkiv returned an entity misbound to a different transaction or terms hash");
   }
+  const createdAtBlock = row.$createdAt ?? null;
+  const createdAtTimestamp = createdAtBlock === null
+    ? null
+    : (await arkivPublicClient.getBlock({ blockNumber: createdAtBlock })).timestamp;
   return {
     entityKey: row.$key,
     transactionId: record.transactionId.value,
@@ -99,6 +105,8 @@ export async function findEvidence(
     decision: record.decision.value,
     decisionRecordId: record.decisionRecordId.value,
     status: record.status.value,
+    createdAtBlock,
+    createdAtTimestamp,
   };
 }
 
@@ -137,6 +145,10 @@ export async function createEvidence(
     { expiration: ExpirationTime.fromDays(30) },
   );
   const result = await arkivPublicClient.getEntity(entityKey, transactionEvidenceSchema);
+  const createdAtBlock = result.$createdAt ?? null;
+  const createdAtTimestamp = createdAtBlock === null
+    ? null
+    : (await arkivPublicClient.getBlock({ blockNumber: createdAtBlock })).timestamp;
 
   return {
     entityKey,
@@ -145,6 +157,8 @@ export async function createEvidence(
     decision: result.decision.value,
     decisionRecordId: result.decisionRecordId.value,
     status: result.status.value,
+    createdAtBlock,
+    createdAtTimestamp,
     txHash,
     created: true,
   };
