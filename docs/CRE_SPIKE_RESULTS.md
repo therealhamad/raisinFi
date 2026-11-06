@@ -25,8 +25,11 @@ This file records observed results only. A missing result means the correspondin
 | TypeScript SDK | Installed and locked at `@chainlink/cre-sdk` `1.23.0` |
 | Sample project simulation | User reports successful compile and local simulation; it read pool values on both chains |
 | Sample EVM write | Simulation returned an all-zero transaction hash; this is not a real testnet transaction |
-| RaisinFi event workflow build/simulation | TypeScript typecheck passed after replacing the sample workflow with two lock-event triggers; CRE simulation with actual settlement contracts remains pending |
-| EVM Write smoke test / transaction hash | Pending; no real testnet write was performed |
+| RaisinFi workflow check | `bun run typecheck` passes with lock-event triggers, proposed cross-chain reads, readiness evaluation, finalized Chain A decision read, proposed report encoding, and the SDK EVM Write adapter; CRE simulation against actual settlement contracts remains pending |
+| Local receiver compile | `bun run compile` in `raisinFi/cre-smoke` passed with solc `0.8.24` (Hardhat warned that installed Node.js `v25.9.0` is outside its supported versions) |
+| Local receiver authorization tests | `bun run test` passed: rejects unauthorized callers, accepts and records a Forwarder report, rejects empty reports |
+| CRE EVM Write smoke workflow | Added as a separate `cre-write-smoke` target; TypeScript typecheck passes. A live CRE simulation/write remains pending because no receiver is deployed and the tenant deployment-access request is pending |
+| EVM Write smoke transaction hash | None; local Hardhat tests do not produce a testnet transaction |
 
 ## Commands and results
 
@@ -43,7 +46,9 @@ The user supplied `cre version` output (`CRE CLI version v1.39.0`), authenticate
 
 The earlier agent-shell installation attempt is separate: the downloaded v1.39.0 macOS ARM64 archive matched the official release SHA-256 (`f0bfb90928cbdf3fccab6ec5420167681edb6ea566982b31016275bc77e09dfb`), but the extracted binary failed local Apple code-signature verification and was not installed or executed. The user's CLI works in their terminal. Their starter-template simulation read both chains and reported a zeroed report transaction hash, so it was local simulation rather than a real testnet transaction.
 
-The CRE TypeScript project resolves `@chainlink/cre-sdk` to `1.23.0` in `my-workflow/node_modules` and `bun.lock`. The starter's pool/APY/rebalance workflow was replaced with the RaisinFi lock-event trigger workflow; no settlement-contract addresses were supplied, so the config currently contains zero-address placeholders.
+The CRE TypeScript project resolves `@chainlink/cre-sdk` to `1.23.0` in `my-workflow/node_modules` and `bun.lock`. The starter's pool/APY/rebalance workflow was replaced with the RaisinFi coordinator. The workflow decodes payment/asset lock events, compares the event participant and amount with the reservation, reads both proposed reservation getters and Chain A decision state, and evaluates transaction/terms/obligation bindings, status, and expiry. It watches `DecisionRecorded` at `FINALIZED` confidence and reads Chain A with `LAST_FINALIZED_BLOCK_NUMBER`. Proposed Chain A/Chain B report payload encoding and an SDK EVM Write adapter are implemented; production workflow writes remain disabled. Getter/report ABIs and enum values remain proposals in `CONTRACT_INTERFACES.md`. No settlement-contract addresses were supplied, so config contains zero-address placeholders and CRE simulation against these functions has not run.
+
+For C4, an isolated `CREReportReceiverSmoke` contract stores a report hash/count and accepts calls only from its constructor-configured Forwarder. Its Hardhat tests passed locally. A separate CRE smoke target encodes a harmless `(string,uint64)` report and routes it through the official SDK EVM Write adapter; the sample receiver address remains zero and is rejected by config validation until a receiver is deployed. The CRE CLI is not available in this agent shell, and no real report transaction or transaction hash has been observed.
 
 ## Remaining setup checks
 

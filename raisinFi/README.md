@@ -1,15 +1,17 @@
 # RaisinFi CRE workflow
 
-This directory is the CRE TypeScript project root. The project was initialized from Chainlink's multi-chain token manager template; its sample APY rebalancing workflow has been replaced with the first RaisinFi vertical slice: validated `PaymentLocked` and `AssetLocked` event triggers.
+This directory is the CRE TypeScript project root. The project was initialized from Chainlink's multi-chain token manager template; its sample APY rebalancing workflow has been replaced with the RaisinFi coordinator.
 
 ## Current workflow scope
 
 - Watches `PaymentLocked` on `ethereum-testnet-sepolia`.
 - Watches `AssetLocked` on `ethereum-testnet-sepolia-base-1`.
-- Checks the emitting contract and event signature, decodes `transactionId` and `termsHash`, and logs the source chain and event reference.
+- Checks the emitting contract and event signature, decodes `transactionId` and `termsHash`, and verifies event participant/amount against the current reservation.
+- Reads both proposed reservation getters and the Chain A decision getter, then evaluates matching terms, status, and expiry.
+- Watches finalized `DecisionRecorded` events and rereads Chain A at `FINALIZED` confidence before evaluating a Base relay.
 - Uses the CRE SDK's `EVMClient.logTrigger` and `logTriggerConfig` APIs.
 
-The lock callbacks do not read settlement state or submit a decision yet. The exact getter ABI and report schema must be agreed with the contract owner first; see `../docs/CONTRACT_INTERFACES.md` from the repository root.
+The reservation getters, enum values, and report tuples are proposals and must be agreed with the contract owner. The EVM Write adapter is implemented, but writes are disabled by default until contracts implement the reviewed receiver interface.
 
 ## Configuration
 
@@ -32,6 +34,7 @@ Simulation is local execution. A report write in simulation is not a DON executi
 ## Project notes
 
 - `my-workflow/domain.ts` contains SDK-independent reservation and decision validation logic.
-- `my-workflow/workflow.ts` contains CRE trigger setup and event decoding.
+- `my-workflow/workflow.ts` contains CRE triggers, cross-chain reads, decision checks, and proposed report encoding.
+- `my-workflow/report-write.ts` wraps the official CRE EVM Write capability.
 - `contracts/evm` currently contains generated contracts from the starter template; these are not the RaisinFi settlement contracts.
 - `docs/CRE_SPIKE_RESULTS.md` records observed setup and simulation results.

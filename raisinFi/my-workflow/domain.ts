@@ -19,10 +19,12 @@ export interface ExpectedTerms {
   paymentContract: string;
   paymentToken: string;
   paymentAmount: string;
+  paymentObligationId: string;
   assetChainId: string;
   assetContract: string;
   assetToken: string;
   assetAmount: string;
+  assetObligationId: string;
   expiresAt: string;
 }
 
@@ -35,6 +37,7 @@ export interface PaymentReservation {
   contract: string;
   token: string;
   amount: string;
+  obligationId: string;
   expiresAt: string;
   status: ReservationStatus;
 }
@@ -48,6 +51,7 @@ export interface AssetReservation {
   contract: string;
   token: string;
   amount: string;
+  obligationId: string;
   expiresAt: string;
   status: ReservationStatus;
 }
@@ -63,12 +67,19 @@ export interface AuthoritativeDecision {
   decision: Decision;
   transactionId: string;
   termsHash: string;
+  paymentObligationId: string;
+  assetObligationId: string;
   sourceChainId: string;
   sourceContract: string;
   destinationChainId: string;
   destinationContract: string;
   recordId: string;
 }
+
+export type DecisionBinding = Pick<
+	ExpectedTerms,
+	'transactionId' | 'termsHash' | 'paymentChainId' | 'paymentContract'
+>
 
 export type DecisionSnapshot = Pick<AuthoritativeDecision, "decision" | "transactionId" | "termsHash">;
 
@@ -143,6 +154,8 @@ function matchesTerms(
     normalizeAddress(asset.token) === normalizeAddress(terms.assetToken) &&
     payment.amount === terms.paymentAmount &&
     asset.amount === terms.assetAmount &&
+    normalizeHex(payment.obligationId) === normalizeHex(terms.paymentObligationId) &&
+    normalizeHex(asset.obligationId) === normalizeHex(terms.assetObligationId) &&
     payment.expiresAt === terms.expiresAt &&
     asset.expiresAt === terms.expiresAt
   );
@@ -195,7 +208,7 @@ export function evaluateReservationReadiness(
 /** Only relay a decision read from the authoritative Chain A contract. */
 export function evaluateDecisionRelay(
   decision: AuthoritativeDecision,
-  terms: ExpectedTerms,
+	terms: DecisionBinding,
   destinationChainId: string,
   destinationContract: string,
 ): RelayAction {

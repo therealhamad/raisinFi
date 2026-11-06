@@ -1,0 +1,7 @@
+{
+  "schedule": "0 * * * * *",
+  "chainName": "ethereum-testnet-sepolia",
+  "receiverAddress": "0x0000000000000000000000000000000000000000",
+  "message": "RaisinFi CRE EVM Write receiver smoke",
+  "sequence": "1"
+}
