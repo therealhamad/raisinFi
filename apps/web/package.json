@@ -1,0 +1,30 @@
+{
+  "name": "raisinfi-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "predev": "npm --prefix ../../contracts run compile && npm --prefix ../../contracts run export-abis",
+    "dev": "next dev",
+    "prebuild": "npm --prefix ../../contracts run compile && npm --prefix ../../contracts run export-abis",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "npm --prefix ../../contracts run compile && npm --prefix ../../contracts run export-abis && tsc --noEmit"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "1.0.1",
+    "next": "15.5.29",
+    "react": "19.2.9",
+    "react-dom": "19.2.9",
+    "viem": "2.57.16"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.8.3"
+  },
+  "overrides": {
+    "postcss": "8.5.32",
+    "zod": "4.6.7"
+  }
+}

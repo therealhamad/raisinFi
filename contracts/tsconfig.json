@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "target": "es2022",
+    "skipLibCheck": true,
+    "types": ["node", "mocha"],
+    "verbatimModuleSyntax": true,
+    "outDir": "dist"
+  },
+  "include": ["hardhat.config.ts", "scripts", "test"]
+}
