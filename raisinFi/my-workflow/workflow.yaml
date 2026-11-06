@@ -32,3 +32,11 @@ production-settings:
     workflow-path: "./main.ts"
     config-path: "./config.json"
     secrets-path: ""
+
+cre-write-smoke:
+  user-workflow:
+    workflow-name: "raisinfi-cre-write-smoke"
+  workflow-artifacts:
+    workflow-path: "./smoke-main.ts"
+    config-path: "./smoke-config.json"
+    secrets-path: ""
