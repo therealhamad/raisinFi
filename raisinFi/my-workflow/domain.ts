@@ -19,7 +19,6 @@ export interface ExpectedTerms {
   paymentContract: string;
   paymentToken: string;
   paymentAmount: string;
-  paymentObligationId: string;
   assetChainId: string;
   assetContract: string;
   assetToken: string;
@@ -37,7 +36,6 @@ export interface PaymentReservation {
   contract: string;
   token: string;
   amount: string;
-  obligationId: string;
   expiresAt: string;
   status: ReservationStatus;
 }
@@ -54,6 +52,9 @@ export interface AssetReservation {
   obligationId: string;
   expiresAt: string;
   status: ReservationStatus;
+  decision: Decision;
+  decisionRecordId: string;
+  decisionNonce: string;
 }
 
 export type Readiness =
@@ -67,8 +68,8 @@ export interface AuthoritativeDecision {
   decision: Decision;
   transactionId: string;
   termsHash: string;
-  paymentObligationId: string;
-  assetObligationId: string;
+  decisionNonce: string;
+  sourceDecisionBlockNumber: string;
   sourceChainId: string;
   sourceContract: string;
   destinationChainId: string;
@@ -87,6 +88,8 @@ export type RelayAction =
   | { action: "WAIT_FOR_DECISION" }
   | { action: "RELAY_COMMIT"; decision: AuthoritativeDecision }
   | { action: "RELAY_ABORT"; decision: AuthoritativeDecision }
+  | { action: "RELAY_ALREADY_APPLIED"; decision: AuthoritativeDecision }
+  | { action: "NO_ASSET_RESERVATION"; decision: AuthoritativeDecision }
   | { action: "REJECT"; reason: string };
 
 const normalizeAddress = (value: string): string => value.toLowerCase();
@@ -154,7 +157,6 @@ function matchesTerms(
     normalizeAddress(asset.token) === normalizeAddress(terms.assetToken) &&
     payment.amount === terms.paymentAmount &&
     asset.amount === terms.assetAmount &&
-    normalizeHex(payment.obligationId) === normalizeHex(terms.paymentObligationId) &&
     normalizeHex(asset.obligationId) === normalizeHex(terms.assetObligationId) &&
     payment.expiresAt === terms.expiresAt &&
     asset.expiresAt === terms.expiresAt
@@ -227,4 +229,31 @@ export function evaluateDecisionRelay(
   return decision.decision === "COMMIT"
     ? { action: "RELAY_COMMIT", decision }
     : { action: "RELAY_ABORT", decision };
+}
+
+/** Reconciliation replay is derived entirely from finalized source and destination state. */
+export function planDecisionRelay(
+  decision: AuthoritativeDecision,
+  terms: DecisionBinding,
+  destinationChainId: string,
+  destinationContract: string,
+  asset: AssetReservation,
+): RelayAction {
+  const relay = evaluateDecisionRelay(decision, terms, destinationChainId, destinationContract);
+  if (relay.action === "REJECT" || relay.action === "WAIT_FOR_DECISION") return relay;
+  if (asset.status === "NONE") {
+    return decision.decision === "ABORT"
+      ? { action: "NO_ASSET_RESERVATION", decision }
+      : { action: "REJECT", reason: "Chain A COMMIT exists without a Chain B asset reservation" };
+  }
+  if (asset.status === "EXECUTED" || asset.status === "RELEASED") {
+    return asset.decision === decision.decision &&
+      normalizeHex(asset.decisionRecordId) === normalizeHex(decision.recordId)
+      ? { action: "RELAY_ALREADY_APPLIED", decision }
+      : { action: "REJECT", reason: "Chain B already processed a different decision record" };
+  }
+  if (asset.status !== "LOCKED") {
+    return { action: "REJECT", reason: `Chain B reservation cannot accept a decision report from status ${asset.status}` };
+  }
+  return relay;
 }

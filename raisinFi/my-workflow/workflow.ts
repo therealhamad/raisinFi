@@ -1,21 +1,21 @@
 import {
 	bytesToHex,
 	cre,
+	decodeJson,
 	encodeCallMsg,
 	getNetwork,
 	LAST_FINALIZED_BLOCK_NUMBER,
 	logTriggerConfig,
 	protoBigIntToBigint,
 	type EVMLog,
+	type HTTPPayload,
 	type Runtime,
 } from '@chainlink/cre-sdk'
 import {
 	decodeEventLog,
 	decodeFunctionResult,
-	encodeAbiParameters,
 	encodeFunctionData,
-	parseAbi,
-	parseAbiParameters,
+	getAbiItem,
 	toEventSelector,
 	type Address,
 	type Hex,
@@ -25,6 +25,7 @@ import { z } from 'zod'
 import {
 	evaluateDecisionRelay,
 	evaluateReservationReadiness,
+	planDecisionRelay,
 	type AssetReservation,
 	type Decision,
 	type ExpectedTerms,
@@ -32,45 +33,30 @@ import {
 	type ReservationStatus,
 } from './domain'
 import { writeCreReport } from './report-write'
+import { assetSettlementAbi, decisionPaymentSettlementAbi } from './contract-abis'
+import {
+	decodeAssetReservation,
+	decodeChainADecision,
+	decodePaymentTransaction,
+	type ProtocolTerms,
+} from './contract-codec'
+import { encodeCoordinationReport, encodeDecisionRelayReport } from './report-encoding'
+import { selectSubmissionPath } from './execution-policy'
 
-const PAYMENT_LOCKED_ABI = parseAbi([
-	'event PaymentLocked(bytes32 indexed transactionId, bytes32 termsHash, address payer, uint256 amount)',
-])
-const ASSET_LOCKED_ABI = parseAbi([
-	'event AssetLocked(bytes32 indexed transactionId, bytes32 termsHash, address seller, uint256 amount)',
-])
-const DECISION_RECORDED_ABI = parseAbi([
-	'event DecisionRecorded(bytes32 indexed transactionId, bytes32 termsHash, uint8 decision)',
-])
-const PAYMENT_RESERVATION_ABI = parseAbi([
-	'function getPaymentReservation(bytes32 transactionId) view returns (bytes32 reservationTransactionId, bytes32 termsHash, bytes32 paymentObligationId, address buyer, address seller, address paymentToken, uint256 paymentAmount, uint256 expiresAt, uint8 status)',
-])
-const ASSET_RESERVATION_ABI = parseAbi([
-	'function getAssetReservation(bytes32 transactionId) view returns (bytes32 reservationTransactionId, bytes32 termsHash, bytes32 assetObligationId, address buyer, address seller, address assetToken, uint256 assetAmount, uint256 expiresAt, uint8 status)',
-])
-const DECISION_ABI = parseAbi([
-	'function getDecision(bytes32 transactionId) view returns (bytes32 decisionTransactionId, bytes32 termsHash, bytes32 paymentObligationId, bytes32 assetObligationId, uint8 decision, bytes32 recordId)',
-])
-const COMMIT_REPORT_PARAMETERS = parseAbiParameters(
-	'bytes32 transactionId, bytes32 termsHash, uint256 paymentChainId, address paymentContract, uint256 assetChainId, address assetContract, bytes32 paymentObligationId, bytes32 assetObligationId',
-)
-const DECISION_RELAY_REPORT_PARAMETERS = parseAbiParameters(
-	'uint256 sourceChainId, address sourceContract, bytes32 transactionId, bytes32 termsHash, bytes32 paymentObligationId, bytes32 assetObligationId, uint8 decision, bytes32 recordId, uint256 sourceDecisionBlockNumber, bytes32 sourceDecisionBlockHash, uint256 destinationChainId, address destinationContract',
-)
-
-const PAYMENT_LOCKED_TOPIC = toEventSelector(
-	'PaymentLocked(bytes32,bytes32,address,uint256)',
-)
-const ASSET_LOCKED_TOPIC = toEventSelector(
-	'AssetLocked(bytes32,bytes32,address,uint256)',
-)
-const DECISION_RECORDED_TOPIC = toEventSelector(
-	'DecisionRecorded(bytes32,bytes32,uint8)',
-)
+const PAYMENT_LOCKED_ABI = [getAbiItem({ abi: decisionPaymentSettlementAbi, name: 'PaymentLocked' })] as const
+const ASSET_LOCKED_ABI = [getAbiItem({ abi: assetSettlementAbi, name: 'AssetLocked' })] as const
+const DECISION_RECORDED_ABI = [getAbiItem({ abi: decisionPaymentSettlementAbi, name: 'DecisionRecorded' })] as const
+const PAYMENT_LOCKED_TOPIC = toEventSelector(PAYMENT_LOCKED_ABI[0])
+const ASSET_LOCKED_TOPIC = toEventSelector(ASSET_LOCKED_ABI[0])
+const DECISION_RECORDED_TOPIC = toEventSelector(DECISION_RECORDED_ABI[0])
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const ZERO_BYTES32 = `0x${'0'.repeat(64)}`
 const PAYMENT_CHAIN_ID = '11155111'
 const ASSET_CHAIN_ID = '84532'
+const PRODUCTION_FORWARDER = '0xF8344CFd5c43616a4366C34E3EEE75af79a74482'
+const PAYMENT_MOCK_FORWARDER = '0x15fC6ae953E024d975e77382eEeC56A9101f9F88'
+const ASSET_MOCK_FORWARDER = '0x82300bd7c3958625581cc2f77bc6464dcecdf3e5'
 
 const contractAddressSchema = z
 	.string()
@@ -78,9 +64,40 @@ const contractAddressSchema = z
 	.refine((address) => address.toLowerCase() !== ZERO_ADDRESS, 'Settlement contract address is not configured')
 
 export const configSchema = z.object({
+	executionMode: z.enum(['local-simulation', 'production-cre']),
 	paymentContractAddress: contractAddressSchema,
 	assetContractAddress: contractAddressSchema,
-	enableWrites: z.boolean().default(false),
+	paymentTokenAddress: contractAddressSchema,
+	assetTokenAddress: contractAddressSchema,
+	paymentDeploymentBlock: z.number().int().nonnegative(),
+	assetDeploymentBlock: z.number().int().nonnegative(),
+	paymentForwarderAddress: contractAddressSchema,
+	assetForwarderAddress: contractAddressSchema,
+	localSubmitterAddress: contractAddressSchema.optional(),
+	reconciliationAuthorizedAddress: contractAddressSchema.optional(),
+	localBroadcastEnabled: z.boolean().default(false),
+	productionWritesEnabled: z.boolean().default(false),
+}).superRefine((config, ctx) => {
+	const expectedPaymentForwarder = config.executionMode === 'local-simulation' ? PAYMENT_MOCK_FORWARDER : PRODUCTION_FORWARDER
+	const expectedAssetForwarder = config.executionMode === 'local-simulation' ? ASSET_MOCK_FORWARDER : PRODUCTION_FORWARDER
+	if (config.paymentForwarderAddress.toLowerCase() !== expectedPaymentForwarder.toLowerCase()) {
+		ctx.addIssue({ code: 'custom', path: ['paymentForwarderAddress'], message: `Must be ${expectedPaymentForwarder} for ${config.executionMode}` })
+	}
+	if (config.assetForwarderAddress.toLowerCase() !== expectedAssetForwarder.toLowerCase()) {
+		ctx.addIssue({ code: 'custom', path: ['assetForwarderAddress'], message: `Must be ${expectedAssetForwarder} for ${config.executionMode}` })
+	}
+	if (config.executionMode === 'local-simulation' && config.productionWritesEnabled) {
+		ctx.addIssue({ code: 'custom', path: ['productionWritesEnabled'], message: 'Production writes cannot be enabled in local-simulation mode' })
+	}
+	if (config.executionMode === 'production-cre' && (config.localBroadcastEnabled || config.localSubmitterAddress)) {
+		ctx.addIssue({ code: 'custom', path: ['localBroadcastEnabled'], message: 'Local test broadcast settings are unavailable in production-cre mode' })
+	}
+	if (config.executionMode === 'production-cre' && !config.reconciliationAuthorizedAddress) {
+		ctx.addIssue({ code: 'custom', path: ['reconciliationAuthorizedAddress'], message: 'Production reconciliation requires an authorized EVM address' })
+	}
+	if (config.localBroadcastEnabled && !config.localSubmitterAddress) {
+		ctx.addIssue({ code: 'custom', path: ['localSubmitterAddress'], message: 'Set the public address derived from CRE_ETH_PRIVATE_KEY before enabling test broadcast' })
+	}
 })
 
 type Config = z.infer<typeof configSchema>
@@ -129,14 +146,88 @@ const decodeDecision = (decisionCode: bigint | number): Decision => {
 	}
 }
 
+const sameProtocolTerms = (left: ProtocolTerms, right: ProtocolTerms): boolean =>
+	left.transactionId.toLowerCase() === right.transactionId.toLowerCase() &&
+	left.buyer.toLowerCase() === right.buyer.toLowerCase() &&
+	left.seller.toLowerCase() === right.seller.toLowerCase() &&
+	left.paymentChainId === right.paymentChainId &&
+	left.paymentContract.toLowerCase() === right.paymentContract.toLowerCase() &&
+	left.paymentInputToken.toLowerCase() === right.paymentInputToken.toLowerCase() &&
+	left.paymentInputAmount === right.paymentInputAmount &&
+	left.paymentToken.toLowerCase() === right.paymentToken.toLowerCase() &&
+	left.paymentAmount === right.paymentAmount &&
+	left.amountOutMin === right.amountOutMin &&
+	left.assetChainId === right.assetChainId &&
+	left.assetSettlement.toLowerCase() === right.assetSettlement.toLowerCase() &&
+	left.assetToken.toLowerCase() === right.assetToken.toLowerCase() &&
+	left.assetAmount === right.assetAmount &&
+	left.expiresAt === right.expiresAt &&
+	left.schemaVersion === right.schemaVersion
+
+const assertReceiverForwarder = (runtime: Runtime<Config>, chainName: string, receiver: Address, expected: Address): void => {
+	const isPaymentChain = chainName === 'ethereum-testnet-sepolia'
+	const abi = isPaymentChain ? decisionPaymentSettlementAbi : assetSettlementAbi
+	const { client } = getEvmClient(chainName)
+	const response = client.callContract(runtime, {
+		call: encodeCallMsg({
+			from: zeroAddress,
+			to: receiver,
+			data: encodeFunctionData({ abi, functionName: 'trustedForwarder' }),
+		}),
+	}).result()
+	const actual = decodeFunctionResult({
+		abi,
+		functionName: 'trustedForwarder',
+		data: bytesToHex(response.data),
+	})
+	if (actual.toLowerCase() !== expected.toLowerCase()) {
+		throw new Error(`Receiver ${receiver} trusts ${actual}, expected ${expected} for ${runtime.config.executionMode}`)
+	}
+}
+
+const verifyCommitAfterWrite = (runtime: Runtime<Config>, transactionId: Hex, termsHash: Hex): void => {
+	const paymentRead = readPaymentReservation(runtime, transactionId, false)
+	const assetRead = readAssetReservation(runtime, transactionId, false)
+	const decision = readAuthoritativeDecision(runtime, transactionId, false)
+	if (decision.decision !== 'COMMIT' || decision.termsHash.toLowerCase() !== termsHash.toLowerCase() || paymentRead.reservation.status !== 'EXECUTED') {
+		throw new Error('Chain A latest state does not verify the COMMIT report and payment execution')
+	}
+	if (assetRead.reservation.status !== 'LOCKED' &&
+		(assetRead.reservation.decision !== 'COMMIT' || assetRead.reservation.decisionRecordId.toLowerCase() !== decision.recordId.toLowerCase())) {
+		throw new Error('Chain B latest state is neither pending nor consistent with the source COMMIT')
+	}
+	runtime.log(`Independent post-COMMIT verification | sourceDecision=${decision.decision} | paymentStatus=${paymentRead.reservation.status} | assetStatus=${assetRead.reservation.status} | sourceFinality=not-yet-reconfirmed`)
+}
+
+const verifyRelayAfterWrite = (runtime: Runtime<Config>, transactionId: Hex, expectedDecision: Decision, expectedRecordId: Hex): void => {
+	const source = readAuthoritativeDecision(runtime, transactionId, false)
+	const payment = readPaymentReservation(runtime, transactionId, false).reservation
+	const destination = readAssetReservation(runtime, transactionId, false).reservation
+	const expectedStatus = expectedDecision === 'COMMIT' ? 'EXECUTED' : 'RELEASED'
+	if (source.decision !== expectedDecision || source.recordId.toLowerCase() !== expectedRecordId.toLowerCase() || source.termsHash.toLowerCase() !== payment.termsHash.toLowerCase()) {
+		throw new Error('Chain A source decision/reservation does not verify during destination relay')
+	}
+	if (expectedDecision === 'COMMIT' && payment.status !== 'EXECUTED') {
+		throw new Error('Chain A payment was not executed for the relayed COMMIT')
+	}
+	if (expectedDecision === 'ABORT' && payment.status !== 'RELEASED' && payment.status !== 'NONE') {
+		throw new Error('Chain A payment state is inconsistent with the relayed ABORT')
+	}
+	if (destination.status !== expectedStatus || destination.decision !== expectedDecision || destination.decisionRecordId.toLowerCase() !== expectedRecordId.toLowerCase()) {
+		throw new Error('Chain B latest state does not verify the relayed decision record')
+	}
+	runtime.log(`Independent post-relay verification | sourceDecision=${source.decision} | sourceRecord=${source.recordId} | destinationStatus=${destination.status} | destinationRecord=${destination.decisionRecordId} | finality=not-yet-reconfirmed`)
+}
+
 const readPaymentReservation = (
 	runtime: Runtime<Config>,
 	transactionId: Hex,
-): PaymentReservation => {
+	finalized = true,
+): { terms: ProtocolTerms; reservation: PaymentReservation } => {
 	const { client } = getEvmClient('ethereum-testnet-sepolia')
 	const callData = encodeFunctionData({
-		abi: PAYMENT_RESERVATION_ABI,
-		functionName: 'getPaymentReservation',
+		abi: decisionPaymentSettlementAbi,
+		functionName: 'getTransaction',
 		args: [transactionId],
 	})
 	const response = client
@@ -146,36 +237,35 @@ const readPaymentReservation = (
 				to: runtime.config.paymentContractAddress as Address,
 				data: callData,
 			}),
+			...(finalized ? { blockNumber: LAST_FINALIZED_BLOCK_NUMBER } : {}),
 		})
 		.result()
-	const [reservationTransactionId, termsHash, obligationId, buyer, seller, token, amount, expiresAt, status] =
-		decodeFunctionResult({
-			abi: PAYMENT_RESERVATION_ABI,
-			functionName: 'getPaymentReservation',
-			data: bytesToHex(response.data),
-		})
+	const decoded = decodePaymentTransaction(bytesToHex(response.data))
 	return {
-		transactionId: reservationTransactionId,
-		termsHash,
-		buyer,
-		seller,
-		chainId: PAYMENT_CHAIN_ID,
-		contract: runtime.config.paymentContractAddress,
-		token,
-		amount: amount.toString(),
-		obligationId,
-		expiresAt: expiresAt.toString(),
-		status: decodeReservationStatus(status),
+		terms: decoded.terms,
+		reservation: {
+			transactionId: decoded.terms.transactionId,
+			termsHash: decoded.termsHash,
+			buyer: decoded.terms.buyer,
+			seller: decoded.terms.seller,
+			chainId: PAYMENT_CHAIN_ID,
+			contract: runtime.config.paymentContractAddress,
+			token: decoded.terms.paymentToken,
+			amount: decoded.terms.paymentAmount.toString(),
+			expiresAt: decoded.terms.expiresAt.toString(),
+			status: decodeReservationStatus(decoded.paymentStatus),
+		},
 	}
 }
 
 const readAssetReservation = (
 	runtime: Runtime<Config>,
 	transactionId: Hex,
-): AssetReservation => {
+	finalized = true,
+): { terms: ProtocolTerms; reservation: AssetReservation } => {
 	const { client } = getEvmClient('ethereum-testnet-sepolia-base-1')
 	const callData = encodeFunctionData({
-		abi: ASSET_RESERVATION_ABI,
+		abi: assetSettlementAbi,
 		functionName: 'getAssetReservation',
 		args: [transactionId],
 	})
@@ -186,37 +276,59 @@ const readAssetReservation = (
 				to: runtime.config.assetContractAddress as Address,
 				data: callData,
 			}),
+			...(finalized ? { blockNumber: LAST_FINALIZED_BLOCK_NUMBER } : {}),
 		})
 		.result()
-	const [reservationTransactionId, termsHash, obligationId, buyer, seller, token, amount, expiresAt, status] =
-		decodeFunctionResult({
-			abi: ASSET_RESERVATION_ABI,
-			functionName: 'getAssetReservation',
-			data: bytesToHex(response.data),
+	const decoded = decodeAssetReservation(bytesToHex(response.data))
+	const obligationCallData = encodeFunctionData({
+		abi: assetSettlementAbi,
+		functionName: 'computeAssetObligationId',
+		args: [decoded.terms],
+	})
+	const obligationResponse = client
+		.callContract(runtime, {
+			call: encodeCallMsg({
+				from: zeroAddress,
+				to: runtime.config.assetContractAddress as Address,
+				data: obligationCallData,
+			}),
+			...(finalized ? { blockNumber: LAST_FINALIZED_BLOCK_NUMBER } : {}),
 		})
+		.result()
+	const [obligationId] = decodeFunctionResult({
+		abi: assetSettlementAbi,
+		functionName: 'computeAssetObligationId',
+		data: bytesToHex(obligationResponse.data),
+	})
 	return {
-		transactionId: reservationTransactionId,
-		termsHash,
-		buyer,
-		seller,
-		chainId: ASSET_CHAIN_ID,
-		contract: runtime.config.assetContractAddress,
-		token,
-		amount: amount.toString(),
-		obligationId,
-		expiresAt: expiresAt.toString(),
-		status: decodeReservationStatus(status),
+		terms: decoded.terms,
+		reservation: {
+			transactionId: decoded.terms.transactionId,
+			termsHash: decoded.termsHash,
+			buyer: decoded.terms.buyer,
+			seller: decoded.terms.seller,
+			chainId: ASSET_CHAIN_ID,
+			contract: runtime.config.assetContractAddress,
+			token: decoded.terms.assetToken,
+			amount: decoded.terms.assetAmount.toString(),
+			obligationId,
+			expiresAt: decoded.terms.expiresAt.toString(),
+			status: decodeReservationStatus(decoded.status),
+			decision: decodeDecision(decoded.decision),
+			decisionRecordId: decoded.decisionRecordId,
+			decisionNonce: decoded.decisionNonce.toString(),
+		},
 	}
 }
 
 const readAuthoritativeDecision = (
 	runtime: Runtime<Config>,
 	transactionId: Hex,
-	finalized = false,
+	finalized = true,
 ) => {
 	const { client } = getEvmClient('ethereum-testnet-sepolia')
 	const callData = encodeFunctionData({
-		abi: DECISION_ABI,
+		abi: decisionPaymentSettlementAbi,
 		functionName: 'getDecision',
 		args: [transactionId],
 	})
@@ -230,22 +342,18 @@ const readAuthoritativeDecision = (
 			...(finalized ? { blockNumber: LAST_FINALIZED_BLOCK_NUMBER } : {}),
 		})
 		.result()
-	const [decisionTransactionId, termsHash, paymentObligationId, assetObligationId, decision, recordId] = decodeFunctionResult({
-		abi: DECISION_ABI,
-		functionName: 'getDecision',
-		data: bytesToHex(response.data),
-	})
+	const decoded = decodeChainADecision(bytesToHex(response.data), transactionId)
 	return {
-		decision: decodeDecision(decision),
-		transactionId: decisionTransactionId,
-		termsHash,
-		paymentObligationId,
-		assetObligationId,
-		sourceChainId: PAYMENT_CHAIN_ID,
-		sourceContract: runtime.config.paymentContractAddress,
+		decision: decodeDecision(decoded.decision),
+		transactionId: decoded.transactionId,
+		termsHash: decoded.termsHash,
+		sourceChainId: decoded.sourceChainId.toString(),
+		sourceContract: decoded.sourceContract,
 		destinationChainId: ASSET_CHAIN_ID,
 		destinationContract: runtime.config.assetContractAddress,
-		recordId,
+		recordId: decoded.recordId,
+		decisionNonce: decoded.nonce.toString(),
+		sourceDecisionBlockNumber: decoded.decisionBlockNumber.toString(),
 	}
 }
 
@@ -253,38 +361,75 @@ const evaluateLockState = (
 	runtime: Runtime<Config>,
 	transactionId: Hex,
 	termsHash: Hex,
-	eventName: LockEventName,
-	eventParticipant: Address,
-	eventAmount: bigint,
+	eventName?: LockEventName,
+	eventParticipant?: Address,
+	eventAmount?: bigint,
+	sourceBlockNumber?: string,
 ): string => {
-	const payment = readPaymentReservation(runtime, transactionId)
-	const asset = readAssetReservation(runtime, transactionId)
+	const paymentRead = readPaymentReservation(runtime, transactionId)
+	const assetRead = readAssetReservation(runtime, transactionId)
+	const payment = paymentRead.reservation
+	const asset = assetRead.reservation
 	const decision = readAuthoritativeDecision(runtime, transactionId)
-	const expectedParticipant = eventName === 'PaymentLocked' ? payment.buyer : asset.seller
-	const expectedAmount = eventName === 'PaymentLocked' ? payment.amount : asset.amount
 	if (
-		eventParticipant.toLowerCase() !== expectedParticipant.toLowerCase() ||
-		eventAmount.toString() !== expectedAmount
+		paymentRead.terms.transactionId.toLowerCase() !== transactionId.toLowerCase() ||
+		payment.termsHash.toLowerCase() !== termsHash.toLowerCase()
 	) {
-		runtime.log(`${eventName} event fields do not match the current reservation; refusing to evaluate COMMIT`)
+		runtime.log('Lock event transaction binding does not match Chain A registered terms')
 		return 'REJECT'
 	}
+	if (eventName && eventParticipant && eventAmount !== undefined) {
+		const expectedParticipant = eventName === 'PaymentLocked'
+			? paymentRead.terms.buyer
+			: assetRead.terms.seller
+		const expectedAmount = eventName === 'PaymentLocked'
+			? paymentRead.terms.paymentInputAmount
+			: assetRead.terms.assetAmount
+		if (
+			eventParticipant.toLowerCase() !== expectedParticipant.toLowerCase() ||
+			eventAmount.toString() !== expectedAmount.toString()
+		) {
+			runtime.log(`${eventName} event fields do not match the current reservation; refusing to evaluate COMMIT`)
+			return 'REJECT'
+		}
+	}
+	if (
+		paymentRead.terms.paymentContract.toLowerCase() !== runtime.config.paymentContractAddress.toLowerCase() ||
+		paymentRead.terms.paymentInputToken.toLowerCase() !== runtime.config.paymentTokenAddress.toLowerCase() ||
+		paymentRead.terms.paymentToken.toLowerCase() !== runtime.config.paymentTokenAddress.toLowerCase() ||
+		paymentRead.terms.assetToken.toLowerCase() !== runtime.config.assetTokenAddress.toLowerCase() ||
+		paymentRead.terms.assetSettlement.toLowerCase() !== runtime.config.assetContractAddress.toLowerCase()
+	) {
+		runtime.log('Registered contract or token addresses do not match the active execution configuration')
+		return 'REJECT'
+	}
+	if (
+		asset.status !== 'NONE' &&
+		(!sameProtocolTerms(paymentRead.terms, assetRead.terms) ||
+			payment.termsHash.toLowerCase() !== asset.termsHash.toLowerCase())
+	) {
+		runtime.log('Chain A and Chain B registered terms do not match; refusing to evaluate COMMIT')
+		return 'REJECT'
+	}
+	if (decision.decision !== 'UNDECIDED') {
+		return onDecisionRecorded(runtime, null, transactionId)
+	}
+	const sourceTerms = paymentRead.terms
 	const terms: ExpectedTerms = {
-		transactionId,
-		termsHash,
-		buyer: payment.buyer,
-		seller: payment.seller,
-		paymentChainId: PAYMENT_CHAIN_ID,
-		paymentContract: runtime.config.paymentContractAddress,
-		paymentToken: payment.token,
-		paymentAmount: payment.amount,
-		paymentObligationId: payment.obligationId,
-		assetChainId: ASSET_CHAIN_ID,
-		assetContract: runtime.config.assetContractAddress,
-		assetToken: asset.token,
-		assetAmount: asset.amount,
+		transactionId: sourceTerms.transactionId,
+		termsHash: payment.termsHash,
+		buyer: sourceTerms.buyer,
+		seller: sourceTerms.seller,
+		paymentChainId: sourceTerms.paymentChainId.toString(),
+		paymentContract: sourceTerms.paymentContract,
+		paymentToken: sourceTerms.paymentToken,
+		paymentAmount: sourceTerms.paymentAmount.toString(),
+		assetChainId: sourceTerms.assetChainId.toString(),
+		assetContract: sourceTerms.assetSettlement,
+		assetToken: sourceTerms.assetToken,
+		assetAmount: sourceTerms.assetAmount.toString(),
 		assetObligationId: asset.obligationId,
-		expiresAt: payment.expiresAt,
+		expiresAt: sourceTerms.expiresAt.toString(),
 	}
 
 	const readiness = evaluateReservationReadiness(
@@ -298,26 +443,46 @@ const evaluateLockState = (
 	if ('reason' in readiness) runtime.log(`Reservation evaluation reason: ${readiness.reason}`)
 	if (readiness.action === 'SUBMIT_COMMIT') {
 		runtime.log('Both matching reservations are locked and unexpired; COMMIT is eligible for Chain A contract validation')
-		if (runtime.config.enableWrites) {
-			const reportPayload = encodeAbiParameters(COMMIT_REPORT_PARAMETERS, [
-				terms.transactionId as Hex,
-				terms.termsHash as Hex,
-				BigInt(terms.paymentChainId),
-				terms.paymentContract as Address,
-				BigInt(terms.assetChainId),
-				terms.assetContract as Address,
-				terms.paymentObligationId as Hex,
-				terms.assetObligationId as Hex,
-			])
-			const result = writeCreReport(
-				runtime,
-				'ethereum-testnet-sepolia',
-				terms.paymentContract as Address,
-				reportPayload,
-			)
-			runtime.log(`Chain A report result | txHash=${result.txHash ?? 'unavailable'} | receiver=${result.receiverExecution}`)
+		const submissionPath = selectSubmissionPath({
+			executionMode: runtime.config.executionMode,
+			allowLocalBroadcast: runtime.config.localBroadcastEnabled,
+			enableProductionWrites: runtime.config.productionWritesEnabled,
+		})
+		const reportPayload = encodeCoordinationReport({
+				transactionId: sourceTerms.transactionId,
+				termsHash: payment.termsHash as Hex,
+				paymentChainId: sourceTerms.paymentChainId,
+				paymentContract: sourceTerms.paymentContract,
+				assetChainId: sourceTerms.assetChainId,
+				assetSettlement: sourceTerms.assetSettlement,
+				buyer: sourceTerms.buyer,
+				seller: sourceTerms.seller,
+				paymentInputToken: sourceTerms.paymentInputToken,
+				paymentInputAmount: sourceTerms.paymentInputAmount,
+				paymentToken: sourceTerms.paymentToken,
+				paymentAmount: sourceTerms.paymentAmount,
+				assetToken: sourceTerms.assetToken,
+				assetAmount: sourceTerms.assetAmount,
+				expiresAt: sourceTerms.expiresAt,
+				paymentLocked: true,
+				assetLocked: true,
+			})
+		runtime.log(`COMMIT report fields | transactionId=${transactionId} | termsHash=${payment.termsHash} | sourceBlock=${sourceBlockNumber ?? 'finalized-state (manual reconciliation)'} | paymentChainId=${sourceTerms.paymentChainId} | paymentContract=${sourceTerms.paymentContract} | assetChainId=${sourceTerms.assetChainId} | assetSettlement=${sourceTerms.assetSettlement} | buyer=${sourceTerms.buyer} | seller=${sourceTerms.seller} | paymentInputToken=${sourceTerms.paymentInputToken} | paymentInputAmount=${sourceTerms.paymentInputAmount} | paymentToken=${sourceTerms.paymentToken} | paymentAmount=${sourceTerms.paymentAmount} | assetToken=${sourceTerms.assetToken} | assetAmount=${sourceTerms.assetAmount} | expiresAt=${sourceTerms.expiresAt} | paymentLocked=true | assetLocked=true | payload=${reportPayload}`)
+		if (submissionPath === 'production-cre-forwarder') {
+			assertReceiverForwarder(runtime, 'ethereum-testnet-sepolia', terms.paymentContract as Address, runtime.config.paymentForwarderAddress as Address)
+			const result = writeCreReport(runtime, 'ethereum-testnet-sepolia', terms.paymentContract as Address, reportPayload)
+			if (result.receiverExecution !== 'SUCCESS') throw new Error(`Chain A receiver execution was ${result.receiverExecution}`)
+			verifyCommitAfterWrite(runtime, transactionId, payment.termsHash as Hex)
+			runtime.log(`Chain A production CRE report | receiver=${terms.paymentContract} | txHash=${result.txHash ?? 'unavailable'}`)
+		} else if (submissionPath === 'local-mock-forwarder') {
+			assertReceiverForwarder(runtime, 'ethereum-testnet-sepolia', terms.paymentContract as Address, runtime.config.paymentForwarderAddress as Address)
+			runtime.log(`LOCAL SIMULATION EVM WRITE | configuredSubmitter=${runtime.config.localSubmitterAddress} | mockForwarder=${runtime.config.paymentForwarderAddress} | testReceiver=${terms.paymentContract} | CLI --broadcast required for a real transaction`)
+			const result = writeCreReport(runtime, 'ethereum-testnet-sepolia', terms.paymentContract as Address, reportPayload)
+			if (result.receiverExecution !== 'SUCCESS') throw new Error(`Local Chain A receiver execution was ${result.receiverExecution}`)
+			verifyCommitAfterWrite(runtime, transactionId, payment.termsHash as Hex)
+			runtime.log(`Local Chain A simulation write result | txHash=${result.txHash ?? 'unavailable'} | receiverExecution=${result.receiverExecution} | verify explorer and state before claiming broadcast`)
 		} else {
-			runtime.log('CRE report submission is disabled; set enableWrites only after the consumer ABI and target have been reviewed')
+			runtime.log(`Report prepared; submission disabled | executionMode=${runtime.config.executionMode} | receiver=${terms.paymentContract} | payload=${reportPayload}`)
 		}
 	}
 
@@ -376,9 +541,13 @@ const handleLockEvent = (
 		throw new Error(`${eventName} log is missing transaction binding fields`)
 	}
 
+	if (!log.blockNumber) throw new Error(`${eventName} trigger is missing its source block number`)
+	const sourceBlockNumber = protoBigIntToBigint(log.blockNumber).toString()
+	const deploymentBlock = eventName === 'PaymentLocked' ? runtime.config.paymentDeploymentBlock : runtime.config.assetDeploymentBlock
+	if (BigInt(sourceBlockNumber) < BigInt(deploymentBlock)) throw new Error(`${eventName} source block predates configured deployment block`)
 	const { chainSelector } = getEvmClient(chainName)
 	runtime.log(
-		`${eventName} observed | source=${chainName} | chainSelector=${chainSelector} | contract=${emittingContract} | transactionId=${transactionId} | termsHash=${termsHash} | txHash=${bytesToHex(log.txHash)} | block=${log.blockNumber?.absVal ?? 'unknown'}`,
+		`${eventName} observed | source=${chainName} | chainSelector=${chainSelector} | contract=${emittingContract} | transactionId=${transactionId} | termsHash=${termsHash} | txHash=${bytesToHex(log.txHash)} | block=${sourceBlockNumber}`,
 	)
 	return evaluateLockState(
 		runtime,
@@ -387,6 +556,7 @@ const handleLockEvent = (
 		eventName,
 		eventParticipant,
 		eventAmount,
+		sourceBlockNumber,
 	)
 }
 
@@ -408,78 +578,178 @@ const onAssetLocked = (runtime: Runtime<Config>, log: EVMLog): string =>
 		log,
 	)
 
-const onDecisionRecorded = (runtime: Runtime<Config>, log: EVMLog): string => {
-	if (log.removed) {
-		runtime.log('Ignoring removed DecisionRecorded log on Ethereum Sepolia')
-		return 'ignored-reorg-removed-log'
+const onDecisionRecorded = (runtime: Runtime<Config>, log: EVMLog | null, reconcileId?: Hex): string => {
+	let transactionId: Hex
+	let termsHash: Hex
+	let eventDecision: number | undefined
+	if (log) {
+		if (log.removed) {
+			runtime.log('Ignoring removed DecisionRecorded log on Ethereum Sepolia')
+			return 'ignored-reorg-removed-log'
+		}
+		const emittingContract = bytesToHex(log.address)
+		if (emittingContract.toLowerCase() !== runtime.config.paymentContractAddress.toLowerCase()) {
+			throw new Error('DecisionRecorded trigger came from an unexpected Chain A contract')
+		}
+		const topics = log.topics.map((topic) => bytesToHex(topic))
+		if (topics[0]?.toLowerCase() !== DECISION_RECORDED_TOPIC.toLowerCase()) {
+			throw new Error('DecisionRecorded trigger has an unexpected event signature')
+		}
+		const decoded = decodeEventLog({
+			abi: DECISION_RECORDED_ABI,
+			data: bytesToHex(log.data),
+			topics: topics as [Hex, ...Hex[]],
+		})
+		transactionId = decoded.args.transactionId
+		termsHash = decoded.args.termsHash
+		eventDecision = decoded.args.decision
+	} else {
+		if (!reconcileId) throw new Error('Reconciliation requires a transactionId')
+		transactionId = reconcileId
+		termsHash = readAuthoritativeDecision(runtime, transactionId, true).termsHash
 	}
-	const emittingContract = bytesToHex(log.address)
-	if (emittingContract.toLowerCase() !== runtime.config.paymentContractAddress.toLowerCase()) {
-		throw new Error('DecisionRecorded trigger came from an unexpected Chain A contract')
-	}
-	const topics = log.topics.map((topic) => bytesToHex(topic))
-	if (topics[0]?.toLowerCase() !== DECISION_RECORDED_TOPIC.toLowerCase()) {
-		throw new Error('DecisionRecorded trigger has an unexpected event signature')
-	}
-	const decoded = decodeEventLog({
-		abi: DECISION_RECORDED_ABI,
-		data: bytesToHex(log.data),
-		topics: topics as [Hex, ...Hex[]],
-	})
-	const { transactionId, termsHash, decision: eventDecision } = decoded.args
 	const decision = readAuthoritativeDecision(runtime, transactionId, true)
-	if (decision.decision !== decodeDecision(eventDecision)) {
+	if (eventDecision !== undefined && decision.decision !== decodeDecision(eventDecision)) {
 		throw new Error('Finalized decision state does not match the DecisionRecorded event')
 	}
-	const relay = evaluateDecisionRelay(
-		decision,
-		{
-			transactionId,
-			termsHash,
-			paymentChainId: PAYMENT_CHAIN_ID,
-			paymentContract: runtime.config.paymentContractAddress,
-		},
-		ASSET_CHAIN_ID,
-		runtime.config.assetContractAddress,
-	)
-	runtime.log(
-		`Finalized Chain A decision observed | transactionId=${transactionId} | termsHash=${termsHash} | decision=${decision.decision} | relay=${relay.action} | txHash=${bytesToHex(log.txHash)}`,
-	)
+	const binding = {
+		transactionId,
+		termsHash,
+		paymentChainId: PAYMENT_CHAIN_ID,
+		paymentContract: runtime.config.paymentContractAddress,
+	}
+	const relay = evaluateDecisionRelay(decision, binding, ASSET_CHAIN_ID, runtime.config.assetContractAddress)
+	if (relay.action === 'REJECT') throw new Error(relay.reason)
+	if (relay.action === 'WAIT_FOR_DECISION') return relay.action
+	if (
+		log && (!log.blockNumber || protoBigIntToBigint(log.blockNumber).toString() !== decision.sourceDecisionBlockNumber)
+	) {
+		throw new Error('Finalized decision getter does not identify the triggering event block')
+	}
+	if (decision.decisionNonce !== '1' || decision.recordId.toLowerCase() === ZERO_BYTES32) {
+		throw new Error('Finalized decision record has an invalid nonce or record ID')
+	}
+	const paymentRead = readPaymentReservation(runtime, transactionId, true)
+	const assetRead = readAssetReservation(runtime, transactionId, true)
+	if (
+		paymentRead.terms.transactionId.toLowerCase() !== transactionId.toLowerCase() ||
+		paymentRead.reservation.termsHash.toLowerCase() !== termsHash.toLowerCase()
+	) {
+		throw new Error('Finalized Chain A transaction does not match the DecisionRecorded event')
+	}
+	if (assetRead.reservation.status === 'NONE' && decision.decision === 'ABORT') {
+		runtime.log('No Chain B asset reservation exists; there is no asset report to relay')
+		return 'NO_ASSET_RESERVATION'
+	}
+	if (
+		paymentRead.terms.paymentContract.toLowerCase() !== runtime.config.paymentContractAddress.toLowerCase() ||
+		paymentRead.terms.paymentInputToken.toLowerCase() !== runtime.config.paymentTokenAddress.toLowerCase() ||
+		paymentRead.terms.paymentToken.toLowerCase() !== runtime.config.paymentTokenAddress.toLowerCase() ||
+		paymentRead.terms.assetSettlement.toLowerCase() !== runtime.config.assetContractAddress.toLowerCase() ||
+		paymentRead.terms.assetToken.toLowerCase() !== runtime.config.assetTokenAddress.toLowerCase()
+	) {
+		throw new Error('Finalized Chain A terms do not match configured contracts or tokens')
+	}
+	if (
+		assetRead.reservation.status !== 'NONE' &&
+		(!sameProtocolTerms(paymentRead.terms, assetRead.terms) ||
+			paymentRead.reservation.termsHash.toLowerCase() !== assetRead.reservation.termsHash.toLowerCase() ||
+			assetRead.reservation.termsHash.toLowerCase() !== termsHash.toLowerCase())
+	) {
+		throw new Error('Finalized cross-chain terms do not match the authoritative Chain A decision')
+	}
+	const relayPlan = planDecisionRelay(decision, binding, ASSET_CHAIN_ID, runtime.config.assetContractAddress, assetRead.reservation)
+	if (relayPlan.action === 'REJECT') throw new Error(relayPlan.reason)
+	if (relayPlan.action === 'NO_ASSET_RESERVATION') return relayPlan.action
+	if (relayPlan.action === 'RELAY_ALREADY_APPLIED') {
+		runtime.log('Chain B already contains this finalized decision record; skipping duplicate report')
+		return relayPlan.action
+	}
+	runtime.log(`Finalized Chain A decision observed | source=${log ? 'DecisionRecorded event' : 'manual reconciliation'} | transactionId=${transactionId} | termsHash=${termsHash} | decision=${decision.decision} | sourceBlock=${decision.sourceDecisionBlockNumber} | relay=${relay.action} | txHash=${log ? bytesToHex(log.txHash) : 'n/a'}`)
 	if ('reason' in relay) runtime.log(`Decision relay reason: ${relay.reason}`)
-	if (relay.action === 'RELAY_COMMIT' || relay.action === 'RELAY_ABORT') {
-		if (runtime.config.enableWrites) {
-			if (!log.blockNumber) throw new Error('Finalized decision event is missing its source block number')
-			const reportPayload = encodeAbiParameters(DECISION_RELAY_REPORT_PARAMETERS, [
-				BigInt(decision.sourceChainId),
-				decision.sourceContract as Address,
-				decision.transactionId as Hex,
-				decision.termsHash as Hex,
-				decision.paymentObligationId as Hex,
-				decision.assetObligationId as Hex,
-				decision.decision === 'COMMIT' ? 1 : 2,
-				decision.recordId as Hex,
-				protoBigIntToBigint(log.blockNumber),
-				bytesToHex(log.blockHash),
-				BigInt(decision.destinationChainId),
-				decision.destinationContract as Address,
-			])
-			const result = writeCreReport(
-				runtime,
-				'ethereum-testnet-sepolia-base-1',
-				decision.destinationContract as Address,
-				reportPayload,
-			)
-			runtime.log(`Chain B report result | txHash=${result.txHash ?? 'unavailable'} | receiver=${result.receiverExecution}`)
+	if (relayPlan.action === 'RELAY_COMMIT' || relayPlan.action === 'RELAY_ABORT') {
+		const submissionPath = selectSubmissionPath({
+			executionMode: runtime.config.executionMode,
+			allowLocalBroadcast: runtime.config.localBroadcastEnabled,
+			enableProductionWrites: runtime.config.productionWritesEnabled,
+		})
+		const sourceTerms = assetRead.terms
+		const reportPayload = encodeDecisionRelayReport({
+				transactionId: decision.transactionId as Hex,
+				termsHash: decision.termsHash as Hex,
+				decision: decision.decision === 'COMMIT' ? 1 : 2,
+				sourceChainId: BigInt(decision.sourceChainId),
+				sourceContract: decision.sourceContract as Address,
+				destinationChainId: BigInt(decision.destinationChainId),
+				destinationContract: decision.destinationContract as Address,
+				assetObligationId: assetRead.reservation.obligationId as Hex,
+				decisionRecordId: decision.recordId as Hex,
+				decisionNonce: BigInt(decision.decisionNonce),
+				sourceDecisionBlockNumber: BigInt(decision.sourceDecisionBlockNumber),
+				buyer: sourceTerms.buyer,
+				seller: sourceTerms.seller,
+				assetToken: sourceTerms.assetToken,
+				assetAmount: sourceTerms.assetAmount,
+				expiresAt: sourceTerms.expiresAt,
+			})
+		runtime.log(`${decision.decision} relay report fields | transactionId=${transactionId} | termsHash=${termsHash} | decision=${decision.decision} | sourceChainId=${decision.sourceChainId} | sourceContract=${decision.sourceContract} | destinationChainId=${decision.destinationChainId} | destinationContract=${decision.destinationContract} | assetObligationId=${assetRead.reservation.obligationId} | decisionRecordId=${decision.recordId} | decisionNonce=${decision.decisionNonce} | sourceDecisionBlock=${decision.sourceDecisionBlockNumber} | buyer=${sourceTerms.buyer} | seller=${sourceTerms.seller} | assetToken=${sourceTerms.assetToken} | assetAmount=${sourceTerms.assetAmount} | expiresAt=${sourceTerms.expiresAt} | payload=${reportPayload}`)
+		if (submissionPath === 'production-cre-forwarder') {
+			assertReceiverForwarder(runtime, 'ethereum-testnet-sepolia-base-1', decision.destinationContract as Address, runtime.config.assetForwarderAddress as Address)
+			const result = writeCreReport(runtime, 'ethereum-testnet-sepolia-base-1', decision.destinationContract as Address, reportPayload)
+			if (result.receiverExecution !== 'SUCCESS') throw new Error(`Chain B receiver execution was ${result.receiverExecution}`)
+			verifyRelayAfterWrite(runtime, transactionId, decision.decision, decision.recordId as Hex)
+			runtime.log(`Chain B production CRE report | receiver=${decision.destinationContract} | txHash=${result.txHash ?? 'unavailable'}`)
+		} else if (submissionPath === 'local-mock-forwarder') {
+			assertReceiverForwarder(runtime, 'ethereum-testnet-sepolia-base-1', decision.destinationContract as Address, runtime.config.assetForwarderAddress as Address)
+			runtime.log(`LOCAL SIMULATION EVM WRITE | configuredSubmitter=${runtime.config.localSubmitterAddress} | mockForwarder=${runtime.config.assetForwarderAddress} | testReceiver=${decision.destinationContract} | CLI --broadcast required for a real transaction`)
+			const result = writeCreReport(runtime, 'ethereum-testnet-sepolia-base-1', decision.destinationContract as Address, reportPayload)
+			if (result.receiverExecution !== 'SUCCESS') throw new Error(`Local Chain B receiver execution was ${result.receiverExecution}`)
+			verifyRelayAfterWrite(runtime, transactionId, decision.decision, decision.recordId as Hex)
+			runtime.log(`Local Chain B simulation write result | txHash=${result.txHash ?? 'unavailable'} | receiverExecution=${result.receiverExecution} | verify explorer and state before claiming broadcast`)
 		} else {
-			runtime.log('Chain B report submission is disabled; set enableWrites only after the consumer ABI and target have been reviewed')
+			runtime.log(`Relay report prepared; submission disabled | executionMode=${runtime.config.executionMode} | receiver=${decision.destinationContract} | payload=${reportPayload}`)
 		}
 	}
 	return relay.action
 }
 
+const reconciliationInputSchema = z.object({
+	transactionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'transactionId must be bytes32'),
+})
+
+const onReconcile = (runtime: Runtime<Config>, payload: HTTPPayload): string => {
+	const { transactionId } = reconciliationInputSchema.parse(decodeJson(payload.input))
+	const id = transactionId as Hex
+	const paymentRead = readPaymentReservation(runtime, id, true)
+	const assetRead = readAssetReservation(runtime, id, true)
+	const decision = readAuthoritativeDecision(runtime, id, true)
+	if (paymentRead.terms.transactionId.toLowerCase() !== id.toLowerCase() ||
+		paymentRead.terms.paymentContract.toLowerCase() !== runtime.config.paymentContractAddress.toLowerCase() ||
+		paymentRead.terms.paymentToken.toLowerCase() !== runtime.config.paymentTokenAddress.toLowerCase() ||
+		paymentRead.terms.assetSettlement.toLowerCase() !== runtime.config.assetContractAddress.toLowerCase() ||
+		paymentRead.terms.assetToken.toLowerCase() !== runtime.config.assetTokenAddress.toLowerCase()) {
+		throw new Error('Reconciliation source reservation differs from configured chain contracts or tokens')
+	}
+	if (assetRead.reservation.status !== 'NONE' &&
+		(!sameProtocolTerms(paymentRead.terms, assetRead.terms) ||
+			paymentRead.reservation.termsHash.toLowerCase() !== assetRead.reservation.termsHash.toLowerCase())) {
+		throw new Error('Reconciliation found mismatched terms or terms hashes across chains')
+	}
+	if (assetRead.reservation.status !== 'NONE' &&
+		(BigInt(assetRead.reservation.obligationId) === 0n || assetRead.terms.assetToken.toLowerCase() !== runtime.config.assetTokenAddress.toLowerCase())) {
+		throw new Error('Reconciliation found a malformed asset obligation or token binding')
+	}
+	runtime.log(`Manual reconciliation | transactionId=${id} | termsHash=${paymentRead.reservation.termsHash} | sourceDecision=${decision.decision} | sourceBlock=${decision.sourceDecisionBlockNumber} | paymentDeploymentBlock=${runtime.config.paymentDeploymentBlock} | assetDeploymentBlock=${runtime.config.assetDeploymentBlock}`)
+	if (decision.decision !== 'UNDECIDED') {
+		return onDecisionRecorded(runtime, null, id)
+	}
+	return evaluateLockState(runtime, id, paymentRead.reservation.termsHash as Hex)
+}
+
 export function initWorkflow(config: Config) {
 	const paymentEvm = getEvmClient('ethereum-testnet-sepolia').client
 	const assetEvm = getEvmClient('ethereum-testnet-sepolia-base-1').client
+	const http = new cre.capabilities.HTTPCapability()
 
 	return [
 		cre.handler(
@@ -487,7 +757,7 @@ export function initWorkflow(config: Config) {
 				logTriggerConfig({
 					addresses: [config.paymentContractAddress as Address],
 					topics: [[PAYMENT_LOCKED_TOPIC]],
-					confidence: 'SAFE',
+					confidence: 'FINALIZED',
 				}),
 			),
 			onPaymentLocked,
@@ -497,7 +767,7 @@ export function initWorkflow(config: Config) {
 				logTriggerConfig({
 					addresses: [config.assetContractAddress as Address],
 					topics: [[ASSET_LOCKED_TOPIC]],
-					confidence: 'SAFE',
+					confidence: 'FINALIZED',
 				}),
 			),
 			onAssetLocked,
@@ -511,6 +781,14 @@ export function initWorkflow(config: Config) {
 				}),
 			),
 			onDecisionRecorded,
+		),
+		cre.handler(
+			http.trigger({
+				authorizedKeys: config.executionMode === 'production-cre'
+					? [{ type: 'KEY_TYPE_ECDSA_EVM', publicKey: config.reconciliationAuthorizedAddress! }]
+					: [],
+			}),
+			onReconcile,
 		),
 	]
 }

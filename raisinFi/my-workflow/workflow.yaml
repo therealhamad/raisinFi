@@ -22,15 +22,22 @@ staging-settings:
     workflow-path: "./main.ts"
     config-path: "./config.json"
     secrets-path: ""
-    
 
-# ==========================================================================
+local-simulation:
+  user-workflow:
+    workflow-name: "raisinfi-transaction-coordinator-local"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: ""
+
+# Production config remains separately gated; productionWritesEnabled must stay false until approved.
 production-settings:
   user-workflow:
     workflow-name: "raisinfi-transaction-coordinator"
   workflow-artifacts:
     workflow-path: "./main.ts"
-    config-path: "./config.json"
+    config-path: "./config.production-cre.json"
     secrets-path: ""
 
 cre-write-smoke:

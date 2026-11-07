@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const outputPath = resolve("../apps/web/src/generated/contract-abis.ts");
+const workflowOutputPath = resolve("../raisinFi/my-workflow/contract-abis.ts");
 const artifacts = [
   ["decisionPaymentSettlementAbi", "DecisionPaymentSettlement", "src/DecisionPaymentSettlement.sol"],
   ["assetSettlementAbi", "AssetSettlement", "src/AssetSettlement.sol"],
@@ -18,3 +19,7 @@ for (const [exportName, contractName, sourcePath] of artifacts) {
 await mkdir(resolve(outputPath, ".."), { recursive: true });
 await writeFile(outputPath, `${exported.join("\n\n")}\n`);
 console.log(`Exported contract ABIs to ${outputPath}`);
+
+await mkdir(resolve(workflowOutputPath, ".."), { recursive: true });
+await writeFile(workflowOutputPath, `${exported.join("\n\n")}\n`);
+console.log(`Exported contract ABIs to ${workflowOutputPath}`);

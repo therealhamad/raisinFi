@@ -8,6 +8,8 @@
     "prebuild": "npm --prefix ../../contracts run compile && npm --prefix ../../contracts run export-abis",
     "build": "next build",
     "start": "next start",
+    "test:finalized-logs": "node --experimental-strip-types --test test/finalized-logs.test.mjs",
+    "test:agreement-draft": "node --experimental-strip-types --experimental-specifier-resolution=node --test test/agreement-draft.test.mjs",
     "typecheck": "npm --prefix ../../contracts run compile && npm --prefix ../../contracts run export-abis && tsc --noEmit"
   },
   "dependencies": {

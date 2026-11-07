@@ -1,16 +1,32 @@
 import { expect } from "chai";
 import { network } from "hardhat";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   AssetSettlement__factory,
   DecisionPaymentSettlement__factory,
   MockERC20__factory,
   RejectingERC20__factory,
 } from "../types/ethers-contracts/index.js";
+import {
+  assetSettlementAbi as creAssetSettlementAbi,
+  decisionPaymentSettlementAbi as creDecisionPaymentSettlementAbi,
+  mockErc20Abi as creMockErc20Abi,
+} from "../../raisinFi/my-workflow/contract-abis.js";
+import {
+  decodeAssetReservation,
+  decodeChainADecision,
+  decodePaymentTransaction,
+} from "../../raisinFi/my-workflow/contract-codec.js";
+import {
+  encodeCoordinationReport as encodeCreCoordinationReport,
+  encodeDecisionRelayReport as encodeCreDecisionRelayReport,
+  type CoordinationReport as CreCoordinationReport,
+  type DecisionRelayReport as CreDecisionRelayReport,
+} from "../../raisinFi/my-workflow/report-encoding.js";
 
-const COORDINATION_REPORT =
-  "tuple(bytes32 transactionId,bytes32 termsHash,uint256 paymentChainId,address paymentContract,uint256 assetChainId,address assetSettlement,address buyer,address seller,address paymentInputToken,uint256 paymentInputAmount,address paymentToken,uint256 paymentAmount,address assetToken,uint256 assetAmount,uint256 expiresAt,bool paymentLocked,bool assetLocked)";
-const DECISION_RELAY_REPORT =
-  "tuple(bytes32 transactionId,bytes32 termsHash,uint8 decision,uint256 sourceChainId,address sourceContract,uint256 destinationChainId,address destinationContract,bytes32 assetObligationId,bytes32 decisionRecordId,uint64 decisionNonce,uint256 sourceDecisionBlockNumber,address buyer,address seller,address assetToken,uint256 assetAmount,uint256 expiresAt)";
+const readArtifactAbi = (path: string) =>
+  JSON.parse(readFileSync(resolve(process.cwd(), path), "utf8")).abi;
 
 async function deployFixture() {
   const paymentNetwork = await network.create({ network: "hardhatSepolia" });
@@ -134,9 +150,8 @@ function encodeCoordinationReport(
   fixture: Awaited<ReturnType<typeof deployFixture>>,
   overrides: Record<string, unknown> = {},
 ) {
-  return fixture.paymentEthers.AbiCoder.defaultAbiCoder().encode(
-    [COORDINATION_REPORT],
-    [coordinationReport(fixture, overrides)],
+  return encodeCreCoordinationReport(
+    coordinationReport(fixture, overrides) as CreCoordinationReport,
   );
 }
 
@@ -165,7 +180,7 @@ async function encodeDecisionRelayReport(
     expiresAt: fixture.terms.expiresAt,
     ...overrides,
   };
-  return fixture.assetEthers.AbiCoder.defaultAbiCoder().encode([DECISION_RELAY_REPORT], [report]);
+  return encodeCreDecisionRelayReport(report as CreDecisionRelayReport);
 }
 
 async function expirePaymentTransaction(fixture: Awaited<ReturnType<typeof deployFixture>>) {
@@ -193,6 +208,75 @@ async function expireAssetReservation(fixture: Awaited<ReturnType<typeof deployF
 }
 
 describe("DecisionPaymentSettlement and AssetSettlement", function () {
+  it("uses CRE ABIs generated from the compiled settlement artifacts", async function () {
+    expect(creDecisionPaymentSettlementAbi).to.deep.equal(
+      readArtifactAbi("artifacts/src/DecisionPaymentSettlement.sol/DecisionPaymentSettlement.json"),
+    );
+    expect(creAssetSettlementAbi).to.deep.equal(
+      readArtifactAbi("artifacts/src/AssetSettlement.sol/AssetSettlement.json"),
+    );
+    expect(creMockErc20Abi).to.deep.equal(
+      readArtifactAbi("artifacts/src/test/MockERC20.sol/MockERC20.json"),
+    );
+  });
+
+  it("decodes the implemented reservation and decision getter results", async function () {
+    const f = await deployFixture();
+    await lockBothSides(f);
+
+    const paymentState = await f.payment.getTransaction(f.transactionId);
+    const paymentReturnData = f.payment.interface.encodeFunctionResult("getTransaction", [
+      paymentState.terms,
+      paymentState.termsHash,
+      paymentState.decision,
+      paymentState.paymentStatus,
+    ]);
+    const decodedPayment = decodePaymentTransaction(paymentReturnData as `0x${string}`);
+    expect(decodedPayment.terms.transactionId).to.equal(f.transactionId);
+    expect(decodedPayment.terms.paymentInputAmount).to.equal(f.terms.paymentInputAmount);
+    expect(decodedPayment.termsHash).to.equal(f.termsHash);
+    expect(decodedPayment.decision).to.equal(0);
+    expect(decodedPayment.paymentStatus).to.equal(1);
+
+    const assetState = await f.asset.getAssetReservation(f.transactionId);
+    const assetReturnData = f.asset.interface.encodeFunctionResult("getAssetReservation", [
+      assetState.terms,
+      assetState.termsHash,
+      assetState.status,
+      assetState.decision,
+      assetState.decisionRecordId,
+      assetState.decisionNonce,
+    ]);
+    const decodedAsset = decodeAssetReservation(assetReturnData as `0x${string}`);
+    expect(decodedAsset.terms.transactionId).to.equal(f.transactionId);
+    expect(decodedAsset.terms.assetAmount).to.equal(f.terms.assetAmount);
+    expect(decodedAsset.termsHash).to.equal(f.termsHash);
+    expect(decodedAsset.status).to.equal(1);
+    expect(decodedAsset.decision).to.equal(0);
+
+    await f.payment.connect(f.forwarder).onReport("0x", encodeCoordinationReport(f));
+    const decisionState = await f.payment.getDecision(f.transactionId);
+    const decisionReturnData = f.payment.interface.encodeFunctionResult("getDecision", [
+      decisionState.decision,
+      decisionState.termsHash,
+      decisionState.sourceChainId,
+      decisionState.sourceContract,
+      decisionState.recordId,
+      decisionState.nonce,
+      decisionState.decisionBlockNumber,
+    ]);
+    const decodedDecision = decodeChainADecision(
+      decisionReturnData as `0x${string}`,
+      f.transactionId as `0x${string}`,
+    );
+    expect(decodedDecision.transactionId).to.equal(f.transactionId);
+    expect(decodedDecision.decision).to.equal(1);
+    expect(decodedDecision.termsHash).to.equal(f.termsHash);
+    expect(decodedDecision.recordId).to.equal(decisionState.recordId);
+    expect(decodedDecision.nonce).to.equal(1n);
+    expect(decodedDecision.decisionBlockNumber).to.equal(decisionState.decisionBlockNumber);
+  });
+
   it("uses the same canonical terms hash on both chains and requires participant locks", async function () {
     const f = await deployFixture();
 
@@ -253,7 +337,7 @@ describe("DecisionPaymentSettlement and AssetSettlement", function () {
     ).to.be.revertedWithCustomError(f.payment, "InvalidCoordinationReport");
   });
 
-  it("atomically commits and pays, then delivers the asset once on the other chain", async function () {
+  it("decodes the CRE COMMIT report, pays, then delivers the asset once on the other chain", async function () {
     const f = await deployFixture();
     await lockBothSides(f);
 
@@ -388,7 +472,7 @@ describe("DecisionPaymentSettlement and AssetSettlement", function () {
     );
   });
 
-  it("relays authoritative ABORT and releases Bob's asset exactly once", async function () {
+  it("decodes the CRE ABORT report and releases Bob's asset exactly once", async function () {
     const f = await deployFixture();
     await f.payment.connect(f.buyer).registerTransaction(f.terms);
     await f.assetToken.connect(f.assetSeller).approve(f.asset.target, f.terms.assetAmount);

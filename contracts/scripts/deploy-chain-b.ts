@@ -18,6 +18,9 @@ for (const [name, address] of [
   }
 }
 
+const chainId = Number((await ethers.provider.getNetwork()).chainId);
+if (chainId !== 84532) throw new Error(`Expected Base Sepolia (84532), got ${chainId}`);
+
 const [deployer] = await ethers.getSigners();
 if (!deployer) throw new Error("No deployment signer is configured for this network");
 
@@ -28,9 +31,6 @@ const contract = await new AssetSettlement__factory(deployer).deploy(
 );
 const receipt = await contract.deploymentTransaction()?.wait();
 if (!receipt) throw new Error("Chain B deployment did not return a transaction receipt");
-
-const chainId = Number((await ethers.provider.getNetwork()).chainId);
-if (chainId !== 84532) throw new Error(`Expected Base Sepolia (84532), got ${chainId}`);
 
 const deployment = {
   contractName: "AssetSettlement",

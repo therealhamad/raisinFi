@@ -14,6 +14,10 @@ if (!/^[1-9][0-9]*$/.test(supply)) {
 }
 
 const { ethers } = await network.create();
+const chainId = Number((await ethers.provider.getNetwork()).chainId);
+if (chainId !== 11155111 && chainId !== 84532) {
+  throw new Error(`Expected Ethereum Sepolia (11155111) or Base Sepolia (84532), got ${chainId}`);
+}
 const [deployer] = await ethers.getSigners();
 if (!deployer) throw new Error("No deployment signer is configured for this network");
 
@@ -26,7 +30,6 @@ const token = await new MockERC20__factory(deployer).deploy(
 const receipt = await token.deploymentTransaction()?.wait();
 if (!receipt) throw new Error("Test token deployment did not return a transaction receipt");
 
-const chainId = Number((await ethers.provider.getNetwork()).chainId);
 const deployment = {
   contractName: "MockERC20",
   name,

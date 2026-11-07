@@ -2,12 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   formatUnits,
   getAddress,
   http,
   isAddress,
+  HttpRequestError,
   parseAbiItem,
+  parseEventLogs,
   parseUnits,
   type Address,
   type Hex,
@@ -19,7 +23,9 @@ import {
   mockErc20Abi,
 } from "@/generated/contract-abis";
 import { arkivPublicClient, createEvidence, findEvidence, type EvidenceResult } from "@/lib/arkiv";
-import { getContractAddresses, parseAddress } from "@/lib/contracts";
+import { getContractAddresses } from "@/lib/contracts";
+import { buildAgreementDraft, type AgreementDraft } from "@/lib/agreement-draft.ts";
+import { deduplicateFinalizedLogs, scanSepoliaFinalizedLogs, SEPOLIA_LOG_CHUNK_SIZE } from "@/lib/finalized-logs";
 import { createTransactionId, hashTerms, type Terms } from "@/lib/protocol";
 import { ThemeToggle } from "./ThemeToggle";
 import {
@@ -57,6 +63,16 @@ type VerifiedReceipt = {
   status: "success";
 };
 
+type RegistrationConfirmation = {
+  transactionId: Hex;
+  termsHash: Hex;
+  buyer: Address;
+  receipt: VerifiedReceipt;
+  eventVerified: boolean;
+  eventError: string | null;
+  finalized: boolean;
+};
+
 type TransactionReference = {
   chainId: number;
   hash: Hex;
@@ -74,6 +90,15 @@ type ChainReceiptEntry = {
   label: string;
   status: "success" | "reverted";
   finalized: boolean;
+};
+
+type AgreementSubmission = {
+  terms: Terms;
+  termsHash: Hex;
+  transactionHash: Hex | null;
+  status: "pending" | "included" | "finalized" | "failed";
+  receipt: VerifiedReceipt | null;
+  error: string | null;
 };
 
 type VerificationEntry = {
@@ -95,9 +120,39 @@ type LifecycleLog = {
   data: Hex;
 };
 
+const PREPARED_DEMO_TERMS: Terms = {
+  transactionId: "0x8f5348a3dbe6899a030bd996c3d6a120a483d7b2b904aa69c6d2f32ad19946fe",
+  buyer: "0xAd60D772BC548Aa250468889C4D58a7D65cAec53",
+  seller: "0x9d0a5005D7d22471750E18996bDeD66B2CaFe5f3",
+  paymentChainId: 11155111n,
+  paymentContract: "0x46474063C039f76111d0a393B8266E377dF7b8e8",
+  paymentInputToken: "0x94420ff404238419452Eb8f25Ddb002e7Aa2a7e5",
+  paymentInputAmount: 1000n * 10n ** 18n,
+  paymentToken: "0x94420ff404238419452Eb8f25Ddb002e7Aa2a7e5",
+  paymentAmount: 1000n * 10n ** 18n,
+  amountOutMin: 0n,
+  assetChainId: 84532n,
+  assetSettlement: "0x9DbFA23d09deb3A66a7261de9E7e708A1b9bBc1A",
+  assetToken: "0x5050Badc7279A059AFC0CDb04d1a63cEFfa0CAaF",
+  assetAmount: 100n * 10n ** 18n,
+  expiresAt: 1794005975n,
+  schemaVersion: 1,
+};
+const PREPARED_DEMO_TERMS_HASH: Hex = "0xd0f6b8ed86de8431953afe99f0f8f93805f21ecfc5c46e70eef115cfaf1026e5";
+const PREPARED_DEMO_BUYER = "0xAd60D772BC548Aa250468889C4D58a7D65cAec53" as Address;
+
+// Prefer the dedicated provider, but keep the previous variable as a deployment fallback.
+// Every Sepolia public read/simulation uses this same resolved endpoint.
+const sepoliaRpcUrl = process.env.NEXT_PUBLIC_ETHEREUM_SEPOLIA_DISCOVERY_RPC_URL
+  || process.env.NEXT_PUBLIC_ETHEREUM_SEPOLIA_RPC_URL
+  || undefined;
 const paymentClient = createPublicClient({
   chain: sepolia,
-  transport: http(process.env.NEXT_PUBLIC_ETHEREUM_SEPOLIA_RPC_URL || undefined),
+  transport: http(sepoliaRpcUrl),
+});
+const discoveryClient = createPublicClient({
+  chain: sepolia,
+  transport: http(sepoliaRpcUrl, { retryCount: 0 }),
 });
 const assetClient = createPublicClient({
   chain: baseSepolia,
@@ -106,6 +161,196 @@ const assetClient = createPublicClient({
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected transaction error";
+}
+
+function findHttpRequestError(error: unknown): HttpRequestError | null {
+  if (error instanceof HttpRequestError) return error;
+  if (!(error instanceof BaseError)) return null;
+  const found = error.walk((cause) => cause instanceof HttpRequestError);
+  return found instanceof HttpRequestError ? found : null;
+}
+
+function errorReasonFromBody(value: unknown, depth = 0): string | null {
+  if (depth > 5 || value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const reason = errorReasonFromBody(item, depth + 1);
+      if (reason) return reason;
+    }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  const body = value as Record<string, unknown>;
+  for (const key of ["reason", "shortMessage", "message", "error", "data"]) {
+    if (!(key in body)) continue;
+    const reason = errorReasonFromBody(body[key], depth + 1);
+    if (reason) return reason;
+  }
+  return null;
+}
+
+function transactionErrorMessage(error: unknown): string {
+  const safeText = (value: string) => value.replace(/https?:\/\/[^\s)]+/gi, "[RPC endpoint]");
+  if (error instanceof BaseError) {
+    const revert = error.walk((cause) => cause instanceof ContractFunctionRevertedError);
+    if (revert instanceof ContractFunctionRevertedError) {
+      const reason = revert.reason || revert.data?.errorName || revert.shortMessage;
+      return `Contract simulation reverted: ${safeText(reason)}`;
+    }
+    const httpError = findHttpRequestError(error);
+    if (httpError) {
+      const reason = errorReasonFromBody(httpError.body);
+      const status = httpError.status ? `HTTP ${httpError.status}` : "HTTP request";
+      return `${status}: ${safeText(reason || httpError.shortMessage)}`;
+    }
+    return safeText([error.shortMessage, error.details].filter(Boolean).join(" — "));
+  }
+  return error instanceof Error ? safeText(error.message) : "Unexpected transaction error";
+}
+
+function rpcErrorStatus(error: unknown): number | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (typeof current !== "object" || current === null) break;
+    if ("status" in current && typeof current.status === "number") return current.status;
+    current = "cause" in current ? current.cause : null;
+  }
+  if (!(error instanceof BaseError)) return undefined;
+  const cause = error.walk((item) =>
+    typeof item === "object" && item !== null && "status" in item && typeof item.status === "number",
+  );
+  return typeof cause === "object" && cause !== null && "status" in cause && typeof cause.status === "number"
+    ? cause.status
+    : undefined;
+}
+
+function isRetryableDiscoveryError(error: unknown): boolean {
+  const status = rpcErrorStatus(error);
+  return status === 408 || status === 429 || (status !== undefined && status >= 500);
+}
+
+function safeRpcText(value: string): string {
+  return value.replace(/https?:\/\/[^\s)]+/gi, "[RPC endpoint]");
+}
+
+function discoveryErrorMessage(error: unknown): string {
+  const httpError = findHttpRequestError(error);
+  const status = rpcErrorStatus(error);
+  if (status === 429) return "Sepolia discovery RPC remained rate-limited after retries. Retry the scan or configure a dedicated discovery RPC endpoint.";
+  if (status !== undefined) {
+    const reason = errorReasonFromBody(httpError?.body)
+      || (error instanceof BaseError ? error.details : null)
+      || (error instanceof BaseError ? error.shortMessage : null)
+      || httpError?.shortMessage
+      || errorMessage(error);
+    return `Sepolia discovery RPC HTTP ${status}: ${safeRpcText(reason)}`;
+  }
+  return safeRpcText(errorMessage(error));
+}
+
+function discoveryLogRangeLimit(error: unknown): bigint | null {
+  if (rpcErrorStatus(error) !== 400) return null;
+  const httpError = findHttpRequestError(error);
+  const message = [
+    httpError?.shortMessage,
+    httpError?.details,
+    error instanceof BaseError ? error.shortMessage : null,
+    error instanceof BaseError ? error.details : null,
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (!/eth_getlogs|block range|range.{0,24}block|block.{0,24}range/.test(message)) return null;
+  const explicitLimit = message.match(/up to\s+(?:a\s+)?(\d+)\s+block/i)
+    || message.match(/maximum(?: of)?\s+(\d+)\s+block/i);
+  return explicitLimit ? BigInt(explicitLimit[1]) : 0n;
+}
+
+function retryDelay(error: unknown, attempt: number): number {
+  const retryAfter = findHttpRequestError(error)?.headers?.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(8000, seconds * 1000);
+    const dateDelay = Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(dateDelay) && dateDelay > 0) return Math.min(8000, dateDelay);
+  }
+  return Math.min(8000, 500 * 2 ** attempt);
+}
+
+function waitForRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+const DISCOVERY_MAX_RETRIES = 5;
+
+async function withDiscoveryRetry<T>(read: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await read();
+    } catch (error) {
+      if (!isRetryableDiscoveryError(error)) throw new Error(discoveryErrorMessage(error));
+      if (attempt >= DISCOVERY_MAX_RETRIES) throw new Error(discoveryErrorMessage(error));
+      await waitForRetry(retryDelay(error, attempt));
+    }
+  }
+}
+
+const DISCOVERY_INITIAL_CHUNK = SEPOLIA_LOG_CHUNK_SIZE;
+const DISCOVERY_MIN_CHUNK = 1n;
+let adaptiveDiscoveryChunkSize = DISCOVERY_INITIAL_CHUNK;
+type RegistrationEventLog = {
+  args?: { transactionId?: Hex };
+  blockNumber: bigint | null;
+  blockHash: Hex | null;
+  transactionHash: Hex | null;
+  logIndex: number | null;
+  address: Address;
+  data: Hex;
+  topics: readonly Hex[];
+};
+
+async function getRegistrationLogs(address: Address, fromBlock: bigint, toBlock: bigint) {
+  let chunkSize = adaptiveDiscoveryChunkSize;
+  let retryAttempt = 0;
+  const logs: RegistrationEventLog[] = [];
+  let cursor = fromBlock;
+  while (cursor <= toBlock) {
+    const chunkEnd = cursor + chunkSize - 1n < toBlock ? cursor + chunkSize - 1n : toBlock;
+    try {
+      const chunkLogs = await discoveryClient.getLogs({
+        address,
+        event: parseAbiItem("event TransactionRegistered(bytes32 indexed transactionId, bytes32 termsHash, address buyer)"),
+        fromBlock: cursor,
+        toBlock: chunkEnd,
+      });
+      logs.push(...chunkLogs as unknown as RegistrationEventLog[]);
+      cursor = chunkEnd + 1n;
+      retryAttempt = 0;
+    } catch (error) {
+      const rangeLimit = discoveryLogRangeLimit(error);
+      if (rangeLimit !== null) {
+        if (chunkSize <= DISCOVERY_MIN_CHUNK) throw new Error(discoveryErrorMessage(error));
+        const halvedChunk = chunkSize / 2n < DISCOVERY_MIN_CHUNK ? DISCOVERY_MIN_CHUNK : chunkSize / 2n;
+        chunkSize = rangeLimit > 0n && rangeLimit < halvedChunk ? rangeLimit : halvedChunk;
+        adaptiveDiscoveryChunkSize = chunkSize;
+        retryAttempt = 0;
+        continue;
+      }
+      if (!isRetryableDiscoveryError(error)) throw new Error(discoveryErrorMessage(error));
+      if (rpcErrorStatus(error) === 429 && chunkSize > DISCOVERY_MIN_CHUNK) {
+        chunkSize = chunkSize / 2n < DISCOVERY_MIN_CHUNK ? DISCOVERY_MIN_CHUNK : chunkSize / 2n;
+        adaptiveDiscoveryChunkSize = chunkSize;
+      }
+      if (retryAttempt >= DISCOVERY_MAX_RETRIES) throw new Error(discoveryErrorMessage(error));
+      await waitForRetry(retryDelay(error, retryAttempt));
+      retryAttempt += 1;
+    }
+  }
+  return deduplicateFinalizedLogs(logs);
+}
+
+function isTransactionNotFound(error: unknown): boolean {
+  if (!(error instanceof BaseError)) return false;
+  const revertError = error.walk((cause) => cause instanceof ContractFunctionRevertedError);
+  return revertError instanceof ContractFunctionRevertedError && revertError.data?.errorName === "TransactionNotFound";
 }
 
 async function verifyEventReceipt(
@@ -133,6 +378,46 @@ async function verifyEventReceipt(
     throw new Error(`${eventName} does not match a successful transaction receipt`);
   }
   return { hash: log.transactionHash, blockNumber: receipt.blockNumber, status: "success" };
+}
+
+async function verifyRegistrationReceipt(terms: Terms, termsHash: Hex, receipt: VerifiedReceipt) {
+  const onchainReceipt = await paymentClient.getTransactionReceipt({ hash: receipt.hash });
+  if (onchainReceipt.status !== "success" || onchainReceipt.blockNumber !== receipt.blockNumber) {
+    throw new Error("Registration receipt no longer matches the successful included receipt");
+  }
+  const registrationLog = parseEventLogs({
+    abi: decisionPaymentSettlementAbi,
+    logs: onchainReceipt.logs,
+    eventName: "TransactionRegistered",
+    strict: true,
+  }).find((log) =>
+    log.address.toLowerCase() === terms.paymentContract.toLowerCase() &&
+    log.args.transactionId.toLowerCase() === terms.transactionId.toLowerCase(),
+  );
+  if (
+    !registrationLog ||
+    registrationLog.args.termsHash.toLowerCase() !== termsHash.toLowerCase() ||
+    registrationLog.args.buyer.toLowerCase() !== terms.buyer.toLowerCase()
+  ) {
+    throw new Error("Successful receipt is missing the matching TransactionRegistered event");
+  }
+  return {
+    transactionId: registrationLog.args.transactionId,
+    termsHash: registrationLog.args.termsHash,
+    buyer: registrationLog.args.buyer,
+  };
+}
+
+function RegistrationConfirmationNotice({ confirmation }: { confirmation: RegistrationConfirmation }) {
+  return (
+    <div className={`notice ${confirmation.finalized ? "success" : "warning"}`} role="status" aria-live="polite">
+      <strong>{confirmation.finalized ? "Registration finalized" : "Registration included — awaiting finality"}</strong>
+      <p>Sepolia receipt block {confirmation.receipt.blockNumber.toString()} · Transaction ID <code>{confirmation.transactionId}</code></p>
+      {confirmation.eventVerified && <p>Receipt event confirms termsHash <code>{confirmation.termsHash}</code> for buyer <code>{confirmation.buyer}</code>.</p>}
+      {confirmation.eventError && <p>Receipt event verification is still pending: {confirmation.eventError}</p>}
+      <a href={`https://sepolia.etherscan.io/tx/${confirmation.receipt.hash}`} target="_blank" rel="noreferrer">View registration receipt {confirmation.receipt.hash} ↗</a>
+    </div>
+  );
 }
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -320,10 +605,12 @@ export function TransactionConsole() {
   const [paymentAmountInput, setPaymentAmountInput] = useState("1000");
   const [assetAmountInput, setAssetAmountInput] = useState("100");
   const [expiryMinutesInput, setExpiryMinutesInput] = useState("15");
+  const [agreementDraft, setAgreementDraft] = useState<AgreementDraft | null>(null);
+  const [agreementSubmission, setAgreementSubmission] = useState<AgreementSubmission | null>(null);
   const [transactionIdInput, setTransactionIdInput] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [activeGuideStep, setActiveGuideStep] = useState(0);
-  const [activeActionPanel, setActiveActionPanel] = useState<"create" | "open" | null>(null);
+  const [activeActionPanel, setActiveActionPanel] = useState<"create" | "prepared" | "open" | null>(null);
   const [verificationEntries, setVerificationEntries] = useState<VerificationEntry[]>([]);
   const [verificationVisibleCount, setVerificationVisibleCount] = useState(2);
   const [verificationHasMore, setVerificationHasMore] = useState(false);
@@ -337,6 +624,12 @@ export function TransactionConsole() {
   const [arkivResult, setArkivResult] = useState<EvidenceResult | null>(null);
   const [arkivBusy, setArkivBusy] = useState(false);
   const [arkivError, setArkivError] = useState<string | null>(null);
+  const [preparedDemoReady, setPreparedDemoReady] = useState(false);
+  const [preparedDemoCheckBusy, setPreparedDemoCheckBusy] = useState(false);
+  const [preparedDemoCheckError, setPreparedDemoCheckError] = useState<string | null>(null);
+  const [preparedDemoVerification, setPreparedDemoVerification] = useState<{ checkedAt: number; blockNumber: bigint; blockTimestamp: bigint } | null>(null);
+  const [preparedDemoSubmission, setPreparedDemoSubmission] = useState<{ hash: Hex; status: "pending" | "included" | "success" | "failure" } | null>(null);
+  const [registrationConfirmation, setRegistrationConfirmation] = useState<RegistrationConfirmation | null>(null);
 
   useEffect(() => {
     if (!window.ethereum) return;
@@ -385,6 +678,54 @@ export function TransactionConsole() {
       return { addresses: null, configurationError: errorMessage(error) };
     }
   }, []);
+  const [paymentInputToken, setPaymentInputToken] = useState<string>("");
+  const [paymentOutputToken, setPaymentOutputToken] = useState<string>("");
+  const [assetTokenInput, setAssetTokenInput] = useState<string>("");
+  const [paymentChainInput, setPaymentChainInput] = useState(String(sepolia.id));
+  const [assetChainInput, setAssetChainInput] = useState(String(baseSepolia.id));
+  const [paymentTokenDecimals, setPaymentTokenDecimals] = useState(18);
+  const [assetTokenDecimals, setAssetTokenDecimals] = useState(18);
+  const [agreementFormError, setAgreementFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!addresses) return;
+    setPaymentInputToken((current) => current || addresses.paymentToken);
+    setPaymentOutputToken((current) => current || addresses.paymentToken);
+    setAssetTokenInput((current) => current || addresses.assetToken);
+  }, [addresses]);
+
+  useEffect(() => {
+    setAgreementDraft(null);
+    setAgreementSubmission(null);
+  }, [address, sellerInput, paymentChainInput, assetChainInput, paymentInputToken, paymentOutputToken, assetTokenInput, paymentAmountInput, assetAmountInput, expiryMinutesInput, paymentTokenDecimals, assetTokenDecimals]);
+
+  const agreementPreview = useMemo(() => {
+    if (!address || !addresses || !sellerInput || !paymentInputToken || !paymentOutputToken || !assetTokenInput) {
+      return { draft: null, error: "Connect the buyer wallet and enter the seller and token addresses to preview Terms." };
+    }
+    try {
+      if (paymentInputToken.trim().toLowerCase() !== paymentOutputToken.trim().toLowerCase()) {
+        throw new Error("Swaps are not enabled; payment input and output token must match.");
+      }
+      return { draft: buildAgreementDraft({
+        buyerInput: address,
+        sellerInput,
+        paymentChainInput,
+        assetChainInput,
+        paymentTokenInput: paymentInputToken,
+        assetTokenInput,
+        paymentAmountInput,
+        assetAmountInput,
+        expiryMinutesInput,
+        paymentDecimals: paymentTokenDecimals,
+        assetDecimals: assetTokenDecimals,
+        paymentContract: addresses.payment,
+        assetSettlement: addresses.asset,
+      }), error: null };
+    } catch (error) {
+      return { draft: null, error: errorMessage(error) };
+    }
+  }, [address, addresses, sellerInput, paymentChainInput, assetChainInput, paymentInputToken, paymentOutputToken, assetTokenInput, paymentAmountInput, assetAmountInput, expiryMinutesInput, paymentTokenDecimals, assetTokenDecimals]);
 
   useEffect(() => {
     const dialog = actionDialogRef.current;
@@ -408,20 +749,22 @@ export function TransactionConsole() {
     return () => window.removeEventListener("keydown", closeOnEscape, true);
   }, [activeActionPanel]);
 
-  const refreshTransaction = useCallback(async (transactionId: Hex) => {
+  const refreshTransaction = useCallback(async (transactionId: Hex, includedReceipt?: VerifiedReceipt) => {
     if (!addresses) return;
     setReadError(null);
     try {
-      const [paymentResult, finalizedBlock] = await Promise.all([
-        paymentClient.readContract({
-          address: addresses.payment,
-          abi: decisionPaymentSettlementAbi,
-          functionName: "getTransaction",
-          args: [transactionId],
-          blockTag: "finalized",
-        }),
-        paymentClient.getBlock({ blockTag: "finalized" }),
-      ]);
+      const finalizedBlock = await paymentClient.getBlock({ blockTag: "finalized" });
+      if (includedReceipt && finalizedBlock.number < includedReceipt.blockNumber) {
+        setSnapshot((current) => current?.terms.transactionId.toLowerCase() === transactionId.toLowerCase() ? current : null);
+        return;
+      }
+      const paymentResult = await paymentClient.readContract({
+        address: addresses.payment,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "getTransaction",
+        args: [transactionId],
+        blockNumber: finalizedBlock.number,
+      });
       const terms = paymentResult[0];
       if (terms.transactionId.toLowerCase() !== transactionId.toLowerCase()) {
         throw new Error("Transaction ID was not found in the finalized Chain A state");
@@ -476,13 +819,15 @@ export function TransactionConsole() {
         const assetFromBlock = process.env.NEXT_PUBLIC_ASSET_DEPLOYMENT_BLOCK
           ? BigInt(process.env.NEXT_PUBLIC_ASSET_DEPLOYMENT_BLOCK)
           : 0n;
-        const registeredLogs = await paymentClient.getLogs({
-          address: addresses.payment,
-          event: parseAbiItem("event TransactionRegistered(bytes32 indexed transactionId, bytes32 termsHash, address buyer)"),
-          args: { transactionId },
-          fromBlock: paymentFromBlock,
-          toBlock: "finalized",
-        });
+        const registeredLogs = await scanSepoliaFinalizedLogs(paymentFromBlock, finalizedBlock.number, (fromBlock, toBlock) =>
+          withDiscoveryRetry(() => paymentClient.getLogs({
+            address: addresses.payment,
+            event: parseAbiItem("event TransactionRegistered(bytes32 indexed transactionId, bytes32 termsHash, address buyer)"),
+            args: { transactionId },
+            fromBlock,
+            toBlock,
+          })),
+        );
         const registeredLog = registeredLogs.find(
           (log) =>
             log.args.termsHash?.toLowerCase() === termsHash.toLowerCase() &&
@@ -492,13 +837,15 @@ export function TransactionConsole() {
         lifecycle.agreement = await verifyEventReceipt(paymentClient, registeredLog, "TransactionRegistered");
 
         if (paymentStatus > 0n) {
-          const logs = await paymentClient.getLogs({
-            address: addresses.payment,
-            event: parseAbiItem("event PaymentLocked(bytes32 indexed transactionId, bytes32 termsHash, address payer, uint256 amount)"),
-            args: { transactionId },
-            fromBlock: paymentFromBlock,
-            toBlock: "finalized",
-          });
+          const logs = await scanSepoliaFinalizedLogs(paymentFromBlock, finalizedBlock.number, (fromBlock, toBlock) =>
+            withDiscoveryRetry(() => paymentClient.getLogs({
+              address: addresses.payment,
+              event: parseAbiItem("event PaymentLocked(bytes32 indexed transactionId, bytes32 termsHash, address payer, uint256 amount)"),
+              args: { transactionId },
+              fromBlock,
+              toBlock,
+            })),
+          );
           const log = logs.find(
             (entry) =>
               entry.args.termsHash?.toLowerCase() === termsHash.toLowerCase() &&
@@ -510,13 +857,15 @@ export function TransactionConsole() {
         }
 
         if (decision !== 0n) {
-          const logs = await paymentClient.getLogs({
-            address: addresses.payment,
-            event: parseAbiItem("event DecisionRecorded(bytes32 indexed transactionId, bytes32 termsHash, uint8 decision)"),
-            args: { transactionId },
-            fromBlock: paymentFromBlock,
-            toBlock: "finalized",
-          });
+          const logs = await scanSepoliaFinalizedLogs(paymentFromBlock, finalizedBlock.number, (fromBlock, toBlock) =>
+            withDiscoveryRetry(() => paymentClient.getLogs({
+              address: addresses.payment,
+              event: parseAbiItem("event DecisionRecorded(bytes32 indexed transactionId, bytes32 termsHash, uint8 decision)"),
+              args: { transactionId },
+              fromBlock,
+              toBlock,
+            })),
+          );
           const log = logs.find(
             (entry) =>
               entry.args.termsHash?.toLowerCase() === termsHash.toLowerCase() &&
@@ -531,13 +880,15 @@ export function TransactionConsole() {
           const event = paymentStatus === 2n
             ? parseAbiItem("event PaymentExecuted(bytes32 indexed transactionId, bytes32 termsHash, address recipient, uint256 amount)")
             : parseAbiItem("event PaymentReleased(bytes32 indexed transactionId, bytes32 termsHash, address recipient, uint256 amount)");
-          const logs = await paymentClient.getLogs({
-            address: addresses.payment,
-            event,
-            args: { transactionId },
-            fromBlock: paymentFromBlock,
-            toBlock: "finalized",
-          });
+          const logs = await scanSepoliaFinalizedLogs(paymentFromBlock, finalizedBlock.number, (fromBlock, toBlock) =>
+            withDiscoveryRetry(() => paymentClient.getLogs({
+              address: addresses.payment,
+              event,
+              args: { transactionId },
+              fromBlock,
+              toBlock,
+            })),
+          );
           const recipient = paymentStatus === 2n ? terms.seller : terms.buyer;
           const amount = paymentStatus === 2n ? terms.paymentAmount : terms.paymentInputAmount;
           const log = logs.find(
@@ -624,6 +975,18 @@ export function TransactionConsole() {
         lifecycle,
         lifecycleReadError,
       });
+      if (
+        includedReceipt &&
+        lifecycle.agreement?.hash.toLowerCase() === includedReceipt.hash.toLowerCase() &&
+        lifecycle.agreement.blockNumber === includedReceipt.blockNumber
+      ) {
+        setRegistrationConfirmation((current) => current?.receipt.hash.toLowerCase() === includedReceipt.hash.toLowerCase()
+          ? { ...current, eventVerified: true, eventError: null, finalized: true }
+          : current);
+        setPreparedDemoSubmission((current) => current?.hash.toLowerCase() === includedReceipt.hash.toLowerCase()
+          ? { ...current, status: "success" }
+          : current);
+      }
       setTransactionIdInput(transactionId);
       if (assetReadError) {
         setReadError(`Chain A read succeeded; Chain B reservation read failed: ${assetReadError}`);
@@ -631,10 +994,19 @@ export function TransactionConsole() {
         setReadError(`Contract state was read, but lifecycle event verification failed: ${lifecycleReadError}`);
       }
     } catch (error) {
+      if (includedReceipt && isTransactionNotFound(error)) return;
       setSnapshot(null);
       setReadError(`Could not read the Chain A transaction: ${errorMessage(error)}`);
     }
   }, [addresses]);
+
+  useEffect(() => {
+    if (!registrationConfirmation || registrationConfirmation.finalized) return;
+    const timer = window.setInterval(() => {
+      void refreshTransaction(registrationConfirmation.transactionId, registrationConfirmation.receipt);
+    }, 12_000);
+    return () => window.clearInterval(timer);
+  }, [registrationConfirmation, refreshTransaction]);
 
   async function loadVerificationBatch(targetCount: number) {
     if (!addresses || verificationBusy) return;
@@ -653,14 +1025,9 @@ export function TransactionConsole() {
           ? cursor - 1999n
           : verificationFloorRef.current;
         const toBlock = cursor;
-        const logs = await paymentClient.getLogs({
-          address: addresses.payment,
-          event: parseAbiItem("event TransactionRegistered(bytes32 indexed transactionId, bytes32 termsHash, address buyer)"),
-          fromBlock,
-          toBlock,
-        });
+        const logs = await getRegistrationLogs(addresses.payment, fromBlock, toBlock);
         const discovered = logs
-          .filter((log): log is typeof log & { args: { transactionId: Hex } } => Boolean(log.args.transactionId))
+          .filter((log): log is RegistrationEventLog & { args: { transactionId: Hex }; blockNumber: bigint } => Boolean(log.args?.transactionId) && log.blockNumber !== null)
           .map((log) => ({ transactionId: log.args.transactionId, blockNumber: log.blockNumber }))
           .sort((left, right) => left.blockNumber > right.blockNumber ? -1 : left.blockNumber < right.blockNumber ? 1 : 0);
         const knownIds = new Set(candidates.map((candidate) => candidate.transactionId.toLowerCase()));
@@ -697,6 +1064,23 @@ export function TransactionConsole() {
     }
   }
 
+  async function initializeVerificationCursor() {
+    const [chainId, finalizedBlock] = await Promise.all([
+      withDiscoveryRetry(() => discoveryClient.getChainId()),
+      withDiscoveryRetry(() => discoveryClient.getBlock({ blockTag: "finalized" })),
+    ]);
+    if (chainId !== sepolia.id) throw new Error(`Configured discovery RPC is on chain ${chainId}, not Sepolia.`);
+    const deploymentBlock = process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK
+      ? BigInt(process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK)
+      : 0n;
+    const endBlock = finalizedBlock.number;
+    verificationFloorRef.current = deploymentBlock;
+    verificationCursorRef.current = endBlock;
+    verificationCandidatesRef.current = [];
+    verificationHasMoreRef.current = endBlock >= deploymentBlock;
+    setVerificationHasMore(endBlock >= deploymentBlock);
+  }
+
   useEffect(() => {
     if (!addresses) return;
     let cancelled = false;
@@ -704,26 +1088,14 @@ export function TransactionConsole() {
       setVerificationBusy(true);
       setVerificationError(null);
       try {
-        const [finalizedBlock, latestBlock] = await Promise.all([
-          paymentClient.getBlock({ blockTag: "finalized" }),
-          paymentClient.getBlockNumber(),
-        ]);
-        const deploymentBlock = process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK
-          ? BigInt(process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK)
-          : 0n;
-        const endBlock = finalizedBlock.number ?? latestBlock;
-        verificationFloorRef.current = deploymentBlock;
-        verificationCursorRef.current = endBlock;
-        verificationCandidatesRef.current = [];
-        verificationHasMoreRef.current = endBlock >= deploymentBlock;
-        setVerificationHasMore(endBlock >= deploymentBlock);
+        await initializeVerificationCursor();
         if (!cancelled) {
           setVerificationEntries([]);
           await loadVerificationBatch(2);
         }
       } catch (error) {
         if (!cancelled) {
-          setVerificationError(errorMessage(error));
+          setVerificationError(discoveryErrorMessage(error));
           setVerificationBusy(false);
         }
       }
@@ -731,6 +1103,21 @@ export function TransactionConsole() {
     void initializeVerification();
     return () => { cancelled = true; };
   }, [addresses]);
+
+  async function retryVerificationScan() {
+    if (!addresses || verificationBusy) return;
+    setVerificationBusy(true);
+    setVerificationError(null);
+    try {
+      await initializeVerificationCursor();
+      setVerificationEntries([]);
+      await loadVerificationBatch(2);
+    } catch (error) {
+      setVerificationError(discoveryErrorMessage(error));
+    } finally {
+      setVerificationBusy(false);
+    }
+  }
 
   async function loadMoreVerification() {
     await loadVerificationBatch(2);
@@ -780,6 +1167,241 @@ export function TransactionConsole() {
   }
 
   useEffect(() => {
+    if (activeActionPanel !== "prepared") return;
+    let cancelled = false;
+    async function checkPreparedDemoReadiness() {
+      setPreparedDemoReady(false);
+      setPreparedDemoVerification(null);
+      setPreparedDemoCheckError(null);
+      setPreparedDemoCheckBusy(false);
+      if (!addresses) {
+        setPreparedDemoCheckError("Configure the deployed contract addresses before registration.");
+        return;
+      }
+      if (!address || address.toLowerCase() !== PREPARED_DEMO_BUYER.toLowerCase()) {
+        setPreparedDemoCheckError("Connect Alice’s wallet to enable this registration.");
+        return;
+      }
+      if (chainId !== sepolia.id) {
+        setPreparedDemoCheckError("Select Ethereum Sepolia (chain ID 11155111) in Coinbase Wallet.");
+        return;
+      }
+
+      setPreparedDemoCheckBusy(true);
+      try {
+        const liveWalletState = await readWalletState(getInjectedProvider());
+        if (!liveWalletState.address || liveWalletState.address.toLowerCase() !== PREPARED_DEMO_BUYER.toLowerCase()) {
+          throw new Error("The connected wallet account is not Alice.");
+        }
+        if (liveWalletState.chainId !== sepolia.id) throw new Error("Connect Alice’s wallet to Ethereum Sepolia (11155111).");
+        if (
+          addresses.payment.toLowerCase() !== PREPARED_DEMO_TERMS.paymentContract.toLowerCase() ||
+          addresses.asset.toLowerCase() !== PREPARED_DEMO_TERMS.assetSettlement.toLowerCase() ||
+          addresses.paymentToken.toLowerCase() !== PREPARED_DEMO_TERMS.paymentInputToken.toLowerCase() ||
+          addresses.paymentToken.toLowerCase() !== PREPARED_DEMO_TERMS.paymentToken.toLowerCase() ||
+          addresses.assetToken.toLowerCase() !== PREPARED_DEMO_TERMS.assetToken.toLowerCase()
+        ) throw new Error("Configured deployment addresses do not match the prepared demo Terms.");
+
+        const [latestBlock, onChainTermsHash] = await Promise.all([
+          paymentClient.getBlock({ blockTag: "latest" }),
+          paymentClient.readContract({
+            address: PREPARED_DEMO_TERMS.paymentContract,
+            abi: decisionPaymentSettlementAbi,
+            functionName: "computeTermsHash",
+            args: [PREPARED_DEMO_TERMS],
+          }),
+        ]);
+        if (cancelled) return;
+        if (hashTerms(PREPARED_DEMO_TERMS).toLowerCase() !== PREPARED_DEMO_TERMS_HASH.toLowerCase()) {
+          throw new Error("Prepared Terms do not match the expected termsHash.");
+        }
+        if (onChainTermsHash.toLowerCase() !== PREPARED_DEMO_TERMS_HASH.toLowerCase()) {
+          throw new Error("Sepolia computeTermsHash did not match the expected termsHash.");
+        }
+        const safetyWindow = 5n * 60n;
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        if (now + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt) {
+          throw new Error("Prepared Terms are expired or within the five-minute signing safety window.");
+        }
+        if (latestBlock.timestamp + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt) {
+          throw new Error("Latest Sepolia block is expired or within the five-minute signing safety window.");
+        }
+
+        let transactionIsRegistered = false;
+        try {
+          await paymentClient.readContract({
+            address: PREPARED_DEMO_TERMS.paymentContract,
+            abi: decisionPaymentSettlementAbi,
+            functionName: "getTransaction",
+            args: [PREPARED_DEMO_TERMS.transactionId],
+          });
+          transactionIsRegistered = true;
+        } catch (error) {
+          if (!isTransactionNotFound(error)) throw error;
+        }
+        if (transactionIsRegistered) throw new Error("This prepared transaction ID is already registered.");
+
+        await paymentClient.simulateContract({
+          address: PREPARED_DEMO_TERMS.paymentContract,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "registerTransaction",
+          args: [PREPARED_DEMO_TERMS],
+          account: PREPARED_DEMO_BUYER,
+        });
+        const verifiedBlock = await paymentClient.getBlock({ blockTag: "latest" });
+        const verifiedNow = BigInt(Math.floor(Date.now() / 1000));
+        if (verifiedNow + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt || verifiedBlock.timestamp + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt) {
+          throw new Error("Prepared Terms entered the five-minute signing safety window during verification.");
+        }
+        if (!cancelled) {
+          setPreparedDemoVerification({
+            checkedAt: Date.now(),
+            blockNumber: verifiedBlock.number ?? 0n,
+            blockTimestamp: verifiedBlock.timestamp,
+          });
+          setPreparedDemoReady(true);
+        }
+      } catch (error) {
+        if (!cancelled) setPreparedDemoCheckError(`Prepared registration is not ready: ${errorMessage(error)}`);
+      } finally {
+        if (!cancelled) setPreparedDemoCheckBusy(false);
+      }
+    }
+    void checkPreparedDemoReadiness();
+    return () => { cancelled = true; };
+  }, [activeActionPanel, address, addresses, chainId]);
+
+  async function registerPreparedDemo() {
+    let submittedHash: Hex | null = null;
+    let receiptReverted = false;
+    let receiptIncluded = false;
+    setActionError(null);
+    setSuccessMessage(null);
+    setPreparedDemoCheckError(null);
+    setPreparedDemoReady(false);
+    setPreparedDemoVerification(null);
+    setPreparedDemoSubmission(null);
+    setAgreementDraft(null);
+    setAgreementSubmission(null);
+    setBusyAction("prepared-demo");
+    try {
+      if (!addresses) throw new Error("Contract configuration is unavailable.");
+      if (
+        addresses.payment.toLowerCase() !== PREPARED_DEMO_TERMS.paymentContract.toLowerCase() ||
+        addresses.asset.toLowerCase() !== PREPARED_DEMO_TERMS.assetSettlement.toLowerCase() ||
+        addresses.paymentToken.toLowerCase() !== PREPARED_DEMO_TERMS.paymentToken.toLowerCase() ||
+        addresses.assetToken.toLowerCase() !== PREPARED_DEMO_TERMS.assetToken.toLowerCase()
+      ) throw new Error("Configured deployment addresses do not match the prepared demo Terms.");
+      const provider = getInjectedProvider();
+      const walletState = await readWalletState(provider);
+      if (!walletState.address || walletState.address.toLowerCase() !== PREPARED_DEMO_BUYER.toLowerCase()) {
+        throw new Error("Coinbase Wallet account changed. Reconnect Alice’s wallet and recheck readiness.");
+      }
+      if (walletState.chainId !== sepolia.id) throw new Error("Select Ethereum Sepolia (chain ID 11155111) before signing.");
+
+      setPreparedDemoCheckBusy(true);
+      const latestBlock = await paymentClient.getBlock({ blockTag: "latest" });
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const safetyWindow = 5n * 60n;
+      if (now + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt || latestBlock.timestamp + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt) {
+        throw new Error("Prepared Terms are expired or within the five-minute signing safety window. Do not sign.");
+      }
+      const [onChainTermsHash, computedTermsHash] = await Promise.all([
+        paymentClient.readContract({
+          address: PREPARED_DEMO_TERMS.paymentContract,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "computeTermsHash",
+          args: [PREPARED_DEMO_TERMS],
+        }),
+        Promise.resolve(hashTerms(PREPARED_DEMO_TERMS)),
+      ]);
+      if (onChainTermsHash.toLowerCase() !== PREPARED_DEMO_TERMS_HASH.toLowerCase() || computedTermsHash.toLowerCase() !== PREPARED_DEMO_TERMS_HASH.toLowerCase()) {
+        throw new Error("Prepared Terms hash verification failed.");
+      }
+      let transactionIsRegistered = false;
+      try {
+        await paymentClient.readContract({
+          address: PREPARED_DEMO_TERMS.paymentContract,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "getTransaction",
+          args: [PREPARED_DEMO_TERMS.transactionId],
+        });
+        transactionIsRegistered = true;
+      } catch (error) {
+        if (!isTransactionNotFound(error)) throw error;
+      }
+      if (transactionIsRegistered) throw new Error("This prepared transaction ID is already registered.");
+      await paymentClient.simulateContract({
+        address: PREPARED_DEMO_TERMS.paymentContract,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "registerTransaction",
+        args: [PREPARED_DEMO_TERMS],
+        account: PREPARED_DEMO_BUYER,
+      });
+      const verifiedBlock = await paymentClient.getBlock({ blockTag: "latest" });
+      const verifiedNow = BigInt(Math.floor(Date.now() / 1000));
+      if (verifiedNow + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt || verifiedBlock.timestamp + safetyWindow >= PREPARED_DEMO_TERMS.expiresAt) {
+        throw new Error("Prepared Terms entered the five-minute signing safety window during verification. Do not sign.");
+      }
+      const verifiedWalletState = await readWalletState(provider);
+      if (!verifiedWalletState.address || verifiedWalletState.address.toLowerCase() !== PREPARED_DEMO_BUYER.toLowerCase() || verifiedWalletState.chainId !== sepolia.id) {
+        throw new Error("Coinbase Wallet account or network changed during verification. Reconnect Alice on Ethereum Sepolia.");
+      }
+      setPreparedDemoVerification({ checkedAt: Date.now(), blockNumber: verifiedBlock.number ?? 0n, blockTimestamp: verifiedBlock.timestamp });
+      setPreparedDemoReady(true);
+      setPreparedDemoCheckBusy(false);
+
+      const walletClient = createTransactionWalletClient(provider, PREPARED_DEMO_BUYER, sepolia.id);
+      const hash = await walletClient.writeContract({
+        address: PREPARED_DEMO_TERMS.paymentContract,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "registerTransaction",
+        args: [PREPARED_DEMO_TERMS],
+        gas: await paymentClient.estimateContractGas({
+          address: PREPARED_DEMO_TERMS.paymentContract,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "registerTransaction",
+          args: [PREPARED_DEMO_TERMS],
+          account: PREPARED_DEMO_BUYER,
+        }),
+      });
+      submittedHash = hash;
+      setPreparedDemoSubmission({ hash, status: "pending" });
+      let receipt: VerifiedReceipt;
+      try {
+        receipt = await waitForSuccess(sepolia.id, hash, PREPARED_DEMO_TERMS.transactionId, PREPARED_DEMO_TERMS.paymentContract);
+      } catch (error) {
+        receiptReverted = errorMessage(error).includes("reverted");
+        throw error;
+      }
+      receiptIncluded = true;
+      recordReceipt(sepolia.id, PREPARED_DEMO_TERMS.transactionId, PREPARED_DEMO_TERMS.paymentContract, "Agreement registered", receipt);
+      setPreparedDemoSubmission({ hash, status: "included" });
+      await recordRegistrationInclusion(PREPARED_DEMO_TERMS, PREPARED_DEMO_TERMS_HASH, receipt);
+      await refreshTransaction(PREPARED_DEMO_TERMS.transactionId, receipt);
+      window.history.replaceState(null, "", `/?id=${PREPARED_DEMO_TERMS.transactionId}`);
+      setPreparedDemoReady(false);
+    } catch (error) {
+      setPreparedDemoCheckBusy(false);
+      const message = errorMessage(error);
+      if (!submittedHash) {
+        setPreparedDemoReady(false);
+        setPreparedDemoCheckError(`Prepared registration could not continue: ${message}`);
+      }
+      if (receiptIncluded) {
+        setActionError(null);
+      } else {
+        setActionError(submittedHash && !receiptReverted
+          ? `Transaction submitted; receipt is still pending. ${message}`
+          : message);
+      }
+      if (submittedHash) setPreparedDemoSubmission({ hash: submittedHash, status: receiptReverted ? "failure" : receiptIncluded ? "included" : "pending" });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  useEffect(() => {
     const sharedTransactionId = new URLSearchParams(window.location.search).get("id");
     if (sharedTransactionId && /^0x[0-9a-fA-F]{64}$/.test(sharedTransactionId)) {
       void refreshTransaction(sharedTransactionId as Hex);
@@ -820,6 +1442,28 @@ export function TransactionConsole() {
     return { hash, blockNumber: receipt.blockNumber, status: "success" };
   }
 
+  async function recordRegistrationInclusion(terms: Terms, termsHash: Hex, receipt: VerifiedReceipt) {
+    setRegistrationConfirmation({
+      transactionId: terms.transactionId,
+      termsHash,
+      buyer: terms.buyer,
+      receipt,
+      eventVerified: false,
+      eventError: null,
+      finalized: false,
+    });
+    try {
+      const event = await verifyRegistrationReceipt(terms, termsHash, receipt);
+      setRegistrationConfirmation((current) => current?.receipt.hash.toLowerCase() === receipt.hash.toLowerCase()
+        ? { ...current, ...event, eventVerified: true, eventError: null }
+        : current);
+    } catch (error) {
+      setRegistrationConfirmation((current) => current?.receipt.hash.toLowerCase() === receipt.hash.toLowerCase()
+        ? { ...current, eventError: errorMessage(error) }
+        : current);
+    }
+  }
+
   function recordReceipt(
     chainId: number,
     transactionId: Hex,
@@ -851,7 +1495,7 @@ export function TransactionConsole() {
     return true;
   }
 
-  async function createTransaction(event: FormEvent<HTMLFormElement>) {
+  async function createTransaction(event: FormEvent<HTMLFormElement>, preparedDraft?: AgreementDraft) {
     event.preventDefault();
     if (!address || !addresses) return;
     setActionError(null);
@@ -864,50 +1508,68 @@ export function TransactionConsole() {
       }
 
       const walletClient = createTransactionWalletClient(getInjectedProvider(), address, sepolia.id);
-      const seller = parseAddress(sellerInput);
-      if (seller.toLowerCase() === address.toLowerCase()) {
-        throw new Error("Buyer and seller must be different wallet addresses");
-      }
-      const paymentAmount = parseUnits(paymentAmountInput, 18);
-      const assetAmount = parseUnits(assetAmountInput, 18);
-      const expiryMinutes = Number(expiryMinutesInput);
-      if (paymentAmount <= 0n || assetAmount <= 0n) throw new Error("Amounts must be greater than zero");
-      if (!Number.isSafeInteger(expiryMinutes) || expiryMinutes < 1 || expiryMinutes > 1440) {
-        throw new Error("Expiry must be between 1 and 1440 minutes");
-      }
-
-      const terms: Terms = {
-        transactionId: createTransactionId(address),
-        buyer: address,
-        seller,
-        paymentChainId: 11155111n,
+      const draft = preparedDraft ?? agreementDraft ?? buildAgreementDraft({
+        buyerInput: address,
+        sellerInput,
+        paymentChainInput,
+        assetChainInput,
+        paymentTokenInput: paymentInputToken,
+        assetTokenInput,
+        paymentAmountInput,
+        assetAmountInput,
+        expiryMinutesInput,
+        paymentDecimals: paymentTokenDecimals,
+        assetDecimals: assetTokenDecimals,
         paymentContract: addresses.payment,
-        paymentInputToken: addresses.paymentToken,
-        paymentInputAmount: paymentAmount,
-        paymentToken: addresses.paymentToken,
-        paymentAmount,
-        amountOutMin: 0n,
-        assetChainId: 84532n,
         assetSettlement: addresses.asset,
-        assetToken: addresses.assetToken,
-        assetAmount,
-        expiresAt: BigInt(Math.floor(Date.now() / 1000) + expiryMinutes * 60),
-        schemaVersion: 1,
-      };
-      const termsHash = hashTerms(terms);
-      const hash = await walletClient.writeContract({
-        address: addresses.payment,
+      });
+      const { terms, termsHash } = draft;
+      setAgreementSubmission({ terms, termsHash, transactionHash: null, status: "pending", receipt: null, error: null });
+      if (terms.buyer.toLowerCase() !== address.toLowerCase()) {
+        throw new Error("The connected buyer account changed after preview. Review the updated Terms.");
+      }
+      if (terms.expiresAt <= BigInt(Math.floor(Date.now() / 1000))) {
+        throw new Error("The agreement expired before submission. Generate a fresh preview.");
+      }
+      await paymentClient.simulateContract({
+        address: terms.paymentContract,
         abi: decisionPaymentSettlementAbi,
         functionName: "registerTransaction",
         args: [terms],
+        account: address,
       });
-      const receipt = await waitForSuccess(sepolia.id, hash, terms.transactionId, addresses.payment);
-      recordReceipt(sepolia.id, terms.transactionId, addresses.payment, "Agreement registered", receipt);
-      await refreshTransaction(terms.transactionId);
+      const hash = await walletClient.writeContract({
+        address: terms.paymentContract,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "registerTransaction",
+        args: [terms],
+        gas: await paymentClient.estimateContractGas({
+          address: terms.paymentContract,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "registerTransaction",
+          args: [terms],
+          account: address,
+        }),
+      });
+      setAgreementSubmission({ terms, termsHash, transactionHash: hash, status: "pending", receipt: null, error: null });
+      const receipt = await waitForSuccess(sepolia.id, hash, terms.transactionId, terms.paymentContract);
+      recordReceipt(sepolia.id, terms.transactionId, terms.paymentContract, "Agreement registered", receipt);
+      setAgreementSubmission({ terms, termsHash, transactionHash: hash, status: "included", receipt, error: null });
+      setTransactionIdInput(terms.transactionId);
+      setSnapshot(null);
       window.history.replaceState(null, "", `/?id=${terms.transactionId}`);
-      setSuccessMessage(`Agreement registered. Terms hash: ${termsHash}`);
+      await recordRegistrationInclusion(terms, termsHash, receipt);
+      await refreshTransaction(terms.transactionId, receipt);
+      setAgreementSubmission({ terms, termsHash, transactionHash: hash, status: "finalized", receipt, error: null });
     } catch (error) {
-      setActionError(errorMessage(error));
+      const message = error instanceof Error && (error.name === "UserRejectedRequestError" || /user rejected|user denied|request rejected/i.test(error.message))
+        ? "Registration was rejected in the wallet. No agreement was registered."
+        : errorMessage(error);
+      setAgreementSubmission((current) => current && current.status !== "finalized"
+        ? { ...current, status: /reverted|failed receipt/i.test(message) ? "failed" : current.status, error: message }
+        : current);
+      setAgreementFormError(message);
+      setActionError(message);
     } finally {
       setBusyAction(null);
     }
@@ -926,12 +1588,56 @@ export function TransactionConsole() {
         throw new Error("Only the agreed buyer wallet can lock this payment");
       }
 
+      // Latest is a duplicate/expiry safety guard only; displayed lifecycle state stays finalized-only.
+      const [latestBlock, latestPayment] = await Promise.all([
+        paymentClient.getBlock({ blockTag: "latest" }),
+        paymentClient.readContract({
+          address: addresses.payment,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "getTransaction",
+          args: [snapshot.terms.transactionId],
+          blockTag: "latest",
+        }),
+      ]);
+      if (
+        latestPayment[0].transactionId.toLowerCase() !== snapshot.terms.transactionId.toLowerCase() ||
+        latestPayment[1].toLowerCase() !== snapshot.termsHash.toLowerCase()
+      ) {
+        throw new Error("Latest Sepolia Terms do not match the finalized agreement. No approval was sent.");
+      }
+      if (latestPayment[3] !== 0) {
+        throw new Error("Payment is already locked in Sepolia latest state; finalized state may still be catching up. Do not retry while awaiting finality.");
+      }
+      if (latestPayment[2] !== 0) {
+        throw new Error("A decision is already recorded in Sepolia latest state. No approval was sent.");
+      }
+      if (latestBlock.timestamp >= snapshot.terms.expiresAt) {
+        throw new Error("The agreement has expired at latest Sepolia block time. No approval was sent.");
+      }
+      const buyerBalance = await paymentClient.readContract({
+        address: snapshot.terms.paymentInputToken,
+        abi: mockErc20Abi,
+        functionName: "balanceOf",
+        args: [address],
+        blockTag: "latest",
+      });
+      if (buyerBalance < snapshot.terms.paymentInputAmount) {
+        throw new Error(`Insufficient Sepolia RDT: need ${formatUnits(snapshot.terms.paymentInputAmount, 18)}, have ${formatUnits(buyerBalance, 18)}. No approval was sent.`);
+      }
+
       const walletClient = createTransactionWalletClient(getInjectedProvider(), address, sepolia.id);
       const approvalHash = await walletClient.writeContract({
         address: snapshot.terms.paymentInputToken,
         abi: mockErc20Abi,
         functionName: "approve",
         args: [addresses.payment, snapshot.terms.paymentInputAmount],
+        gas: await paymentClient.estimateContractGas({
+          address: snapshot.terms.paymentInputToken,
+          abi: mockErc20Abi,
+          functionName: "approve",
+          args: [addresses.payment, snapshot.terms.paymentInputAmount],
+          account: address,
+        }),
       });
       const approvalReceipt = await waitForSuccess(
         sepolia.id,
@@ -940,19 +1646,59 @@ export function TransactionConsole() {
         snapshot.terms.paymentInputToken,
       );
       recordReceipt(sepolia.id, snapshot.terms.transactionId, snapshot.terms.paymentInputToken, "Payment approval", approvalReceipt);
+      const verifiedAllowance = await paymentClient.readContract({
+        address: snapshot.terms.paymentInputToken,
+        abi: mockErc20Abi,
+        functionName: "allowance",
+        args: [address, addresses.payment],
+        blockTag: "latest",
+      });
+      if (verifiedAllowance !== snapshot.terms.paymentInputAmount) {
+        throw new Error(`Approval did not set an exact ${formatUnits(snapshot.terms.paymentInputAmount, 18)} RDT allowance. Lock was not submitted.`);
+      }
+      const lockPreflightBlock = await paymentClient.getBlock({ blockTag: "latest" });
+      const lockPreflightState = await paymentClient.readContract({
+        address: addresses.payment,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "getTransaction",
+        args: [snapshot.terms.transactionId],
+        blockTag: "latest",
+      });
+      if (
+        lockPreflightState[1].toLowerCase() !== snapshot.termsHash.toLowerCase() ||
+        lockPreflightState[2] !== 0 ||
+        lockPreflightState[3] !== 0 ||
+        lockPreflightBlock.timestamp >= snapshot.terms.expiresAt
+      ) {
+        throw new Error("Latest Sepolia lock preflight changed after approval. Lock was not submitted.");
+      }
 
+      await paymentClient.simulateContract({
+        address: addresses.payment,
+        abi: decisionPaymentSettlementAbi,
+        functionName: "lockPayment",
+        args: [snapshot.terms.transactionId, snapshot.termsHash],
+        account: address,
+      });
       const lockHash = await walletClient.writeContract({
         address: addresses.payment,
         abi: decisionPaymentSettlementAbi,
         functionName: "lockPayment",
         args: [snapshot.terms.transactionId, snapshot.termsHash],
+        gas: await paymentClient.estimateContractGas({
+          address: addresses.payment,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "lockPayment",
+          args: [snapshot.terms.transactionId, snapshot.termsHash],
+          account: address,
+        }),
       });
       const lockReceipt = await waitForSuccess(sepolia.id, lockHash, snapshot.terms.transactionId, addresses.payment);
       recordReceipt(sepolia.id, snapshot.terms.transactionId, addresses.payment, "Payment locked", lockReceipt);
       await refreshTransaction(snapshot.terms.transactionId);
       setSuccessMessage("Payment reservation confirmed on Ethereum Sepolia.");
     } catch (error) {
-      setActionError(errorMessage(error));
+      setActionError(transactionErrorMessage(error));
     } finally {
       setBusyAction(null);
     }
@@ -1022,6 +1768,13 @@ export function TransactionConsole() {
         abi: decisionPaymentSettlementAbi,
         functionName: "abort",
         args: [snapshot.terms.transactionId],
+        gas: await paymentClient.estimateContractGas({
+          address: addresses.payment,
+          abi: decisionPaymentSettlementAbi,
+          functionName: "abort",
+          args: [snapshot.terms.transactionId],
+          account: address,
+        }),
       });
       const receipt = await waitForSuccess(sepolia.id, hash, snapshot.terms.transactionId, addresses.payment);
       recordReceipt(sepolia.id, snapshot.terms.transactionId, addresses.payment, "Chain A abort", receipt);
@@ -1046,20 +1799,21 @@ export function TransactionConsole() {
         return;
       }
 
+      const paymentFinalizedBlock = await paymentClient.getBlock({ blockTag: "finalized" });
       const [currentDecision, currentPayment, currentAsset] = await Promise.all([
         paymentClient.readContract({
           address: addresses.payment,
           abi: decisionPaymentSettlementAbi,
           functionName: "getDecision",
           args: [snapshot.terms.transactionId],
-          blockTag: "finalized",
+          blockNumber: paymentFinalizedBlock.number,
         }),
         paymentClient.readContract({
           address: addresses.payment,
           abi: decisionPaymentSettlementAbi,
           functionName: "getTransaction",
           args: [snapshot.terms.transactionId],
-          blockTag: "finalized",
+          blockNumber: paymentFinalizedBlock.number,
         }),
         assetClient.readContract({
           address: addresses.asset,
@@ -1087,15 +1841,19 @@ export function TransactionConsole() {
       const paymentEvent = decision === 1n
         ? parseAbiItem("event PaymentExecuted(bytes32 indexed transactionId, bytes32 termsHash, address recipient, uint256 amount)")
         : parseAbiItem("event PaymentReleased(bytes32 indexed transactionId, bytes32 termsHash, address recipient, uint256 amount)");
-      const paymentLogs = await paymentClient.getLogs({
-        address: addresses.payment,
-        event: paymentEvent,
-        args: { transactionId: snapshot.terms.transactionId },
-        fromBlock: process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK
+      const paymentLogs = await scanSepoliaFinalizedLogs(
+        process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK
           ? BigInt(process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK)
           : 0n,
-        toBlock: "finalized",
-      });
+        paymentFinalizedBlock.number,
+        (fromBlock, toBlock) => withDiscoveryRetry(() => paymentClient.getLogs({
+          address: addresses.payment,
+          event: paymentEvent,
+          args: { transactionId: snapshot.terms.transactionId },
+          fromBlock,
+          toBlock,
+        })),
+      );
       const assetLogs = assetStatus === 2n
         ? await assetClient.getLogs({
             address: addresses.asset,
@@ -1480,12 +2238,17 @@ export function TransactionConsole() {
         <div className="settlement-actions-heading">
           <p className="eyebrow">Take action</p>
           <h2>Continue a settlement</h2>
-          <p>Start a new agreement or inspect an existing transaction. Either path can be used independently.</p>
+          <p>Create a new agreement, register the prepared RaisinFi demo, or inspect an existing transaction.</p>
         </div>
         <div className="settlement-action-list">
           <button className="settlement-action-button create-action" type="button" onClick={() => setActiveActionPanel("create")}>
             <span className="settlement-action-symbol">+</span>
             <span><small>NEW AGREEMENT</small><strong>Create Transaction</strong><em>Agree terms and register on Ethereum Sepolia</em></span>
+            <span className="settlement-action-arrow" aria-hidden="true">↗</span>
+          </button>
+          <button className="settlement-action-button create-action" type="button" onClick={() => setActiveActionPanel("prepared")}>
+            <span className="settlement-action-symbol">✓</span>
+            <span><small>PREPARED DEMO</small><strong>Register RaisinFi Demo</strong><em>Review Alice’s fixed Sepolia registration Terms</em></span>
             <span className="settlement-action-arrow" aria-hidden="true">↗</span>
           </button>
           <button className="settlement-action-button open-action" type="button" onClick={() => setActiveActionPanel("open")}>
@@ -1500,7 +2263,7 @@ export function TransactionConsole() {
         <dialog
           ref={actionDialogRef}
           className="action-dialog"
-          aria-label={activeActionPanel === "create" ? "Create transaction" : "Open an agreement"}
+          aria-label={activeActionPanel === "create" ? "Create transaction" : activeActionPanel === "prepared" ? "Register prepared RaisinFi demo" : "Open an agreement"}
           onCancel={(event) => { event.preventDefault(); setActiveActionPanel(null); }}
           onClick={(event) => { if (event.target === event.currentTarget) setActiveActionPanel(null); }}
         >
@@ -1530,63 +2293,175 @@ export function TransactionConsole() {
             </div>
             <span className={`chain-pill ${chainId === sepolia.id ? "active" : ""}`}>Chain A</span>
           </div>
-          <form onSubmit={createTransaction} className="form">
+          <form onSubmit={(event) => { event.preventDefault(); if (agreementPreview.draft) setAgreementDraft(agreementPreview.draft); }} className="form agreement-form">
+            <div className="form-row">
+              <label>
+                Buyer wallet · connected account
+                <span className="field-hint">This account must sign on Ethereum Sepolia</span>
+                <input value={address ?? "Connect wallet to select buyer"} readOnly aria-label="Connected buyer wallet" />
+              </label>
+              <label>
+                Seller wallet
+                <span className="field-hint">Seller address on Base Sepolia</span>
+                <input autoComplete="off" placeholder="0x…" value={sellerInput} onChange={(event) => setSellerInput(event.target.value)} required />
+              </label>
+            </div>
+            <div className="form-row">
+              <label>
+                Payment chain ID
+                <span className="field-hint">Configured settlement supports Sepolia only</span>
+                <input inputMode="numeric" value={paymentChainInput} onChange={(event) => setPaymentChainInput(event.target.value)} required />
+              </label>
+              <label>
+                Asset chain ID
+                <span className="field-hint">Configured settlement supports Base Sepolia only</span>
+                <input inputMode="numeric" value={assetChainInput} onChange={(event) => setAssetChainInput(event.target.value)} required />
+              </label>
+            </div>
             <label>
-              Seller wallet
-              <span className="field-hint">Seller address on Base Sepolia</span>
-              <input
-                autoComplete="off"
-                placeholder="0x…"
-                value={sellerInput}
-                onChange={(event) => setSellerInput(event.target.value)}
-                required
-              />
+              Payment token address
+              <span className="field-hint">Input and output tokens must match; swaps are disabled</span>
+              <input autoComplete="off" placeholder="0x…" value={paymentInputToken} onChange={(event) => { setPaymentInputToken(event.target.value); setPaymentOutputToken(event.target.value); }} required />
+            </label>
+            <label>
+              Asset token address
+              <span className="field-hint">Token locked on Base Sepolia</span>
+              <input autoComplete="off" placeholder="0x…" value={assetTokenInput} onChange={(event) => setAssetTokenInput(event.target.value)} required />
             </label>
             <div className="form-row">
               <label>
+                Payment amount · decimals
+                <span className="field-hint">Payment token precision (0–18)</span>
+                <input inputMode="numeric" type="number" min="0" max="18" value={paymentTokenDecimals} onChange={(event) => setPaymentTokenDecimals(Number(event.target.value))} required />
+              </label>
+              <label>
+                Asset amount · decimals
+                <span className="field-hint">Asset token precision (0–18)</span>
+                <input inputMode="numeric" type="number" min="0" max="18" value={assetTokenDecimals} onChange={(event) => setAssetTokenDecimals(Number(event.target.value))} required />
+              </label>
+            </div>
+            <div className="form-row">
+              <label>
                 Payment amount
-                <span className="field-hint">Payment token amount · 18 decimals</span>
-                <input
-                  inputMode="decimal"
-                  value={paymentAmountInput}
-                  onChange={(event) => setPaymentAmountInput(event.target.value)}
-                  required
-                />
+                <span className="field-hint">Human-readable token quantity</span>
+                <input inputMode="decimal" value={paymentAmountInput} onChange={(event) => setPaymentAmountInput(event.target.value)} required />
               </label>
               <label>
                 Asset quantity
-                <span className="field-hint">Asset token quantity · 18 decimals</span>
-                <input
-                  inputMode="decimal"
-                  value={assetAmountInput}
-                  onChange={(event) => setAssetAmountInput(event.target.value)}
-                  required
-                />
+                <span className="field-hint">Human-readable token quantity</span>
+                <input inputMode="decimal" value={assetAmountInput} onChange={(event) => setAssetAmountInput(event.target.value)} required />
               </label>
             </div>
             <label>
               Expiry (minutes)
-              <span className="field-hint">Agreement lifetime · 1 to 1440 minutes</span>
-              <input
-                type="number"
-                min="1"
-                max="1440"
-                value={expiryMinutesInput}
-                onChange={(event) => setExpiryMinutesInput(event.target.value)}
-                required
-              />
+              <span className="field-hint">Agreement lifetime from preview · 1 to 1440 minutes</span>
+              <input type="number" min="1" max="1440" value={expiryMinutesInput} onChange={(event) => setExpiryMinutesInput(event.target.value)} required />
             </label>
-            <p className="muted small">
-              Amounts use 18 decimal places. Registering the agreement does not move funds; Alice and Bob submit their own locks.
-            </p>
+            <section className="agreement-preview" aria-label="Agreement preview">
+              <div className="action-card-heading"><div><p className="eyebrow">Review before signing</p><h3>Terms preview</h3></div></div>
+              {agreementPreview.error ? <p className="notice warning" role="status">{agreementPreview.error}</p> : agreementPreview.draft && (
+                <div className="terms-grid">
+                  <div><span>Buyer</span><code>{agreementPreview.draft.terms.buyer}</code></div>
+                  <div><span>Seller</span><code>{agreementPreview.draft.terms.seller}</code></div>
+                  <div><span>Networks</span><code>Sepolia ({agreementPreview.draft.terms.paymentChainId.toString()}) → Base Sepolia ({agreementPreview.draft.terms.assetChainId.toString()})</code></div>
+                  <div><span>Payment</span><code>{formatUnits(agreementPreview.draft.terms.paymentAmount, agreementPreview.draft.paymentDecimals)} · {agreementPreview.draft.terms.paymentInputToken}</code></div>
+                  <div><span>Asset</span><code>{formatUnits(agreementPreview.draft.terms.assetAmount, agreementPreview.draft.assetDecimals)} · {agreementPreview.draft.terms.assetToken}</code></div>
+                  <div><span>Expires</span><code>{new Date(Number(agreementPreview.draft.terms.expiresAt) * 1000).toISOString()}</code></div>
+                  <div><span>Transaction ID</span><code>{agreementPreview.draft.terms.transactionId}</code></div>
+                  <div><span>Terms hash</span><code>{agreementPreview.draft.termsHash}</code></div>
+                </div>
+              )}
+            </section>
+            <p className="muted small">Preview is generated locally with the protocol's canonical Terms hash. Registering does not move funds. The wallet will request a separate manual signature after validation and simulation.</p>
+            {agreementSubmission && (
+              <div className={`notice ${agreementSubmission.status === "finalized" ? "success" : agreementSubmission.status === "failed" ? "error" : "warning"}`} role="status" aria-live="polite">
+                <strong>{agreementSubmission.status === "finalized" ? "Agreement registered and finalized" : agreementSubmission.status === "included" ? "Registration included — finality is not yet confirmed" : agreementSubmission.status === "failed" ? "Registration failed before broadcast" : "Registration submitted — waiting for confirmation"}</strong>
+                <p>Transaction ID: <code>{agreementSubmission.terms.transactionId}</code></p><p>Terms hash: <code>{agreementSubmission.termsHash}</code></p>
+                {agreementSubmission.transactionHash && <p>Wallet transaction: <code>{agreementSubmission.transactionHash}</code></p>}
+                {agreementSubmission.receipt && <p>Included in Sepolia block {agreementSubmission.receipt.blockNumber.toString()}.</p>}
+                {agreementSubmission.error && <p>{agreementSubmission.error}</p>}
+                {agreementSubmission.status === "included" && !agreementSubmission.error && <p>Waiting for the registration to reach finalized Sepolia state; this may take a while.</p>}
+              </div>
+            )}
+            {agreementFormError && <p className="notice error" role="alert">{agreementFormError}</p>}
             <div className="form-actions">
               <button className="button secondary" type="button" onClick={() => setActiveActionPanel(null)}>Cancel</button>
-              <button className={`button action-submit${busyAction === "create" ? " is-loading" : ""}`} disabled={!isConnected || !addresses || busyAction !== null}>
-                {busyAction === "create" ? "Registering…" : "Create and register"}
+              <button className="button secondary" type="button" onClick={() => { if (agreementPreview.draft) setAgreementDraft(agreementPreview.draft); }} disabled={!agreementPreview.draft}>Refresh preview</button>
+              <button className={`button action-submit${busyAction === "create" ? " is-loading" : ""}`} type="button" onClick={(event) => { event.preventDefault(); if (!agreementPreview.draft) return; setAgreementDraft(agreementPreview.draft); setAgreementFormError(null); void createTransaction({ preventDefault() {} } as FormEvent<HTMLFormElement>, agreementPreview.draft); }} disabled={!isConnected || chainId !== sepolia.id || !addresses || !agreementPreview.draft || busyAction !== null}>
+                {busyAction === "create" ? "Registering…" : "Confirm & register"}
               </button>
             </div>
           </form>
         </article>
+            )}
+
+            {activeActionPanel === "prepared" && (
+              <article className="card action-card create-card prepared-card" aria-busy={busyAction === "prepared-demo" || preparedDemoCheckBusy}>
+                <div className="action-card-heading">
+                  <div className="card-art card-art-agreement" aria-hidden="true">
+                    <span className="art-orbit orbit-one" />
+                    <span className="art-orbit orbit-two" />
+                    <svg viewBox="0 0 88 88" fill="none"><path d="M25 17h27l13 13v42H25z" /><path d="M52 17v14h13M35 44h20M35 53h20M35 62h12" /><circle cx="62" cy="61" r="13" /><path d="m56 61 4 4 8-9" /></svg>
+                  </div>
+                  <div className="action-heading-copy">
+                    <p className="eyebrow">Prepared demo · no approvals or locks</p>
+                    <h2>Register prepared agreement</h2>
+                    <p className="action-description">Review the fixed Terms. Registration does not move tokens.</p>
+                  </div>
+                  <span className={`chain-pill ${chainId === sepolia.id ? "active" : ""}`}>Ethereum Sepolia</span>
+                </div>
+                <div className="terms-grid prepared-terms-grid">
+                  <div><span>Transaction ID</span><code>{PREPARED_DEMO_TERMS.transactionId}</code></div>
+                  <div><span>Expected termsHash</span><code>{PREPARED_DEMO_TERMS_HASH}</code></div>
+                  <div><span>Buyer · Alice</span><code>{PREPARED_DEMO_TERMS.buyer}</code></div>
+                  <div><span>Seller · Bob</span><code>{PREPARED_DEMO_TERMS.seller}</code></div>
+                  <div><span>Networks</span><code>Ethereum Sepolia (11155111) → Base Sepolia (84532)</code></div>
+                  <div><span>Payment</span><code>1,000 RDT · direct token on Ethereum Sepolia</code></div>
+                  <div><span>Asset</span><code>100 RDT · Base Sepolia</code></div>
+                  <div><span>Expiry (UTC)</span><code>{new Date(Number(PREPARED_DEMO_TERMS.expiresAt) * 1000).toISOString()}</code></div>
+                </div>
+                <p className="muted small">Payment contract: <code>{PREPARED_DEMO_TERMS.paymentContract}</code><br />Asset contract: <code>{PREPARED_DEMO_TERMS.assetSettlement}</code></p>
+                <div className="prepared-readiness" role="status" aria-live="polite">
+                  {preparedDemoCheckBusy ? (
+                    <p className="notice">Checking account, expiry margin, Sepolia hash, registration state and read-only simulation…</p>
+                  ) : preparedDemoReady ? (
+                    <p className="notice success">Ready for Alice’s manual signature. On-chain termsHash and register simulation passed; transaction ID is unregistered.</p>
+                  ) : (
+                    <p className="notice warning">{preparedDemoCheckError ?? "Connect Alice’s Coinbase Wallet on Ethereum Sepolia to verify readiness."}</p>
+                  )}
+                  {preparedDemoVerification && (
+                    <p className="muted small">Checked {new Date(preparedDemoVerification.checkedAt).toLocaleTimeString()} · Sepolia block {preparedDemoVerification.blockNumber.toString()} timestamp {new Date(Number(preparedDemoVerification.blockTimestamp) * 1000).toISOString()}</p>
+                  )}
+                </div>
+                {isConnected && chainId !== sepolia.id && (
+                  <button className="button secondary" type="button" onClick={() => void changeWalletChain(sepolia.id)} disabled={isSwitching}>
+                    {isSwitching ? "Switching…" : "Switch to Ethereum Sepolia"}
+                  </button>
+                )}
+                {preparedDemoSubmission && !registrationConfirmation && (
+                  <div className={`notice ${preparedDemoSubmission.status === "success" ? "success" : preparedDemoSubmission.status === "failure" ? "error" : "warning"}`} role="status" aria-live="polite">
+                    <strong>{preparedDemoSubmission.status === "success" ? "Registration finalized" : preparedDemoSubmission.status === "included" ? "Registration included — awaiting finality" : preparedDemoSubmission.status === "failure" ? "Registration reverted" : "Transaction submitted · waiting for receipt"}</strong>
+                    <a href={`https://sepolia.etherscan.io/tx/${preparedDemoSubmission.hash}`} target="_blank" rel="noreferrer">View transaction {preparedDemoSubmission.hash} ↗</a>
+                  </div>
+                )}
+                {(actionError || successMessage) && (
+                  <div className="dialog-errors">
+                    {actionError && <p className="notice error" role="alert">{actionError}</p>}
+                    {successMessage && <p className="notice success" role="status">{successMessage}</p>}
+                  </div>
+                )}
+                <div className="form-actions">
+                  <button className="button secondary" type="button" onClick={() => setActiveActionPanel(null)}>Close</button>
+                  <button
+                    className={`button action-submit${busyAction === "prepared-demo" ? " is-loading" : ""}`}
+                    type="button"
+                    disabled={!preparedDemoReady || preparedDemoCheckBusy || busyAction !== null || preparedDemoSubmission?.status === "pending" || preparedDemoSubmission?.status === "included" || preparedDemoSubmission?.status === "success"}
+                    onClick={() => void registerPreparedDemo()}
+                  >
+                    {busyAction === "prepared-demo" ? "Rechecking and waiting…" : preparedDemoSubmission?.status === "pending" ? "Waiting for receipt…" : preparedDemoSubmission?.status === "included" ? "Awaiting finality…" : preparedDemoSubmission?.status === "success" ? "Registration finalized" : "Verify and register prepared Terms"}
+                  </button>
+                </div>
+              </article>
             )}
 
             {activeActionPanel === "open" && (
@@ -1654,11 +2529,12 @@ export function TransactionConsole() {
           </div>
         </article>
             )}
-            {(actionError || readError || successMessage) && (
+            {(actionError || readError || successMessage || registrationConfirmation) && (
               <div className="dialog-errors">
                 {actionError && <p className="notice error" role="alert">{actionError}</p>}
                 {activeActionPanel === "open" && readError && <p className="notice error" role="alert">{readError}</p>}
                 {successMessage && <p className="notice success" role="status">{successMessage}</p>}
+                {registrationConfirmation && <RegistrationConfirmationNotice confirmation={registrationConfirmation} />}
               </div>
             )}
           </div>
@@ -1668,6 +2544,7 @@ export function TransactionConsole() {
       {!activeActionPanel && actionError && <div className="notice error" role="alert">{actionError}</div>}
       {!activeActionPanel && readError && <div className="notice error" role="alert">{readError}</div>}
       {!activeActionPanel && successMessage && <div className="notice success" role="status">{successMessage}</div>}
+      {!activeActionPanel && registrationConfirmation && <RegistrationConfirmationNotice confirmation={registrationConfirmation} />}
 
       {snapshot && addresses && (
         <section className="card transaction">
@@ -1711,7 +2588,7 @@ export function TransactionConsole() {
                 onClick={() => void lockPayment()}
                 disabled={!isConnected || busyAction !== null || snapshot.paymentStatus !== 0n || snapshot.decision !== 0n}
               >
-                {busyAction === "payment" ? "Locking payment…" : "Alice: approve and lock payment"}
+                {busyAction === "payment" ? "Locking payment…" : `Alice: approve ${formatUnits(snapshot.terms.paymentInputAmount, 18)} RDT and lock payment`}
               </button>
             </article>
             <article className="obligation">
@@ -1777,7 +2654,7 @@ export function TransactionConsole() {
           <div className="verification-empty verification-error" role="alert">
             <strong>Transaction discovery unavailable</strong>
             <span>{verificationError}</span>
-            <button type="button" className="button secondary" onClick={() => void loadVerificationBatch(2)} disabled={verificationBusy}>Retry scan</button>
+            <button type="button" className="button secondary" onClick={() => void retryVerificationScan()} disabled={verificationBusy}>Retry scan</button>
           </div>
         ) : verificationEntries.length === 0 ? (
           <p className="verification-empty">No finalized transaction registrations were found in the scanned block range.</p>

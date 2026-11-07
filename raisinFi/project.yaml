@@ -24,5 +24,5 @@ default: &default
       url: https://base-sepolia-rpc.publicnode.com
 
 staging-settings: *default
-
+local-simulation: *default
 production-settings: *default

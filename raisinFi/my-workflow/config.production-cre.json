@@ -1,0 +1,14 @@
+{
+  "executionMode": "production-cre",
+  "paymentContractAddress": "0x0000000000000000000000000000000000000000",
+  "assetContractAddress": "0x0000000000000000000000000000000000000000",
+  "paymentTokenAddress": "0x0000000000000000000000000000000000000000",
+  "assetTokenAddress": "0x0000000000000000000000000000000000000000",
+  "paymentDeploymentBlock": 0,
+  "assetDeploymentBlock": 0,
+  "paymentForwarderAddress": "0xF8344CFd5c43616a4366C34E3EEE75af79a74482",
+  "assetForwarderAddress": "0xF8344CFd5c43616a4366C34E3EEE75af79a74482",
+  "reconciliationAuthorizedAddress": "0x0000000000000000000000000000000000000000",
+  "localBroadcastEnabled": false,
+  "productionWritesEnabled": false
+}

@@ -2,5 +2,6 @@ node_modules/
 .next/
 out/
 coverage/
+.env.local
 src/generated/
 next-env.d.ts

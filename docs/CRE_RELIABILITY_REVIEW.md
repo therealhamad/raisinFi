@@ -1,135 +1,84 @@
 # CRE Workflow Reliability and Reconciliation Review
 
 Review date: 2026-11-06  
-Scope: current CRE TypeScript workflow and its checked-in configuration/tests. No implementation changes were made as part of this review.
+Scope: current CRE workflow, committed Solidity settlement contracts, contract artifacts/tests, local-simulation execution adapters and UI chain reads. Isolated Sepolia and Base Sepolia demo token/settlement deployments are now live; no CRE report broadcast or CRE DON execution was performed.
 
 ## Executive summary
 
-The workflow has useful fail-closed checks: it filters lock logs by configured address/topic, rejects removed logs, checks decoded participant/amount against current reservations, compares both reservation reads, decodes unknown enum values as errors, keeps writes disabled by default, and reads Chain A decision state at `LAST_FINALIZED_BLOCK_NUMBER` before relaying a finalized decision.
+The earlier CRE/Solidity ABI mismatch has been reconciled in the current worktree. The CRE workflow now reads the actual Chain A `getTransaction`, Chain B `getAssetReservation`, and Chain A `getDecision` outputs using ABI constants generated from compiled Hardhat artifacts. COMMIT and ABORT report payloads use the exact current `ProtocolTypes` field order. Fifteen Hardhat tests pass, including ABI identity, getter decoding, production encoder-to-receiver COMMIT/ABORT flows, and duplicate relay rejection.
 
-Those safeguards do not provide end-to-end exactly-once settlement or recovery. CRE callbacks are independent executions with no persistent callback state, and the current project has no periodic reconciliation handler, event cursor/backfill, workflow-side deduplication, destination-state confirmation, or application status persistence. This is a safe architecture only if the settlement contracts enforce atomic, write-once decisions and idempotent destination handling, and if another reliable path can recheck/reconcile decisions that were not relayed. Those contract properties are not verified because the settlement contracts and deployed ABIs are not in this repository.
+Contract-side decision safety is now verified from source and tests: Chain A accepts COMMIT only while undecided, payment locked, and before expiry; permissionless ABORT accepts only after expiry and while undecided. State and token transfer revert atomically. Base accepts a decision only for a locked reservation and rejects subsequent reports after it has been delivered/released.
 
-The most important gaps are:
+The full deployed execution path remains unproven. Isolated demo tokens and settlement receivers have been deployed to Sepolia and Base Sepolia, and each receiver's immutable `trustedForwarder` is the corresponding tenant mock Forwarder. The local workflow config points at these deployments while both write flags remain false. No CRE report broadcast or CRE DON execution has been performed. The CRE CLI v1.39.0 is installed, but tenant DON deployment access is unavailable.
 
-1. Duplicate lock/decision triggers can submit the same report more than once. The workflow has no delivery key or durable dedupe record.
-2. A missed or failed event has no recovery path in this workflow. In particular, a delayed/lost Chain A decision event can leave Base locked after Chain A is decided.
-3. A readiness read and subsequent Chain A COMMIT report are separate operations. Expiry ABORT can race the report; only an atomic Chain A contract check can safely choose the winner.
-4. `writeCreReport` treats `receiverExecutionStatus=UNKNOWN` as a returnable result, and the business callbacks can return `SUBMIT_COMMIT`/`RELAY_COMMIT` without checking destination finalized state. These values mean a report path ran, not that settlement is complete.
-5. The lock-event terms are checked for cross-chain consistency, but the workflow does not compare them to an independent agreed-terms source or recompute `termsHash`.
+CRE documentation describes callbacks as fresh, independent, stateless executions ([CRE overview](https://docs.chain.link/cre/overview)); EVM Write delivers reports through the configured Forwarder to `onReport(bytes,bytes)` ([EVM Read & Write](https://docs.chain.link/cre/capabilities/evm-read-write)). Durable idempotency therefore rests on contract state, not workflow memory.
 
-**Status labels used below:** **Verified** means visible in the checked-in code. **Assumption** means it depends on contract/runtime behavior not established by this repository. **Proposal** means a recommended change, not existing behavior.
+## Resolved findings
+
+| Finding | Current implementation and evidence |
+|---|---|
+| Incorrect Chain A reservation getter | **Resolved:** `readPaymentReservation` calls `DecisionPaymentSettlement.getTransaction(bytes32)` and decodes Terms, terms hash, decision, and payment status (`workflow.ts`, `contract-codec.ts`). Solidity source is `contracts/src/DecisionPaymentSettlement.sol::getTransaction`. |
+| Incorrect Chain B reservation structure | **Resolved:** `readAssetReservation` decodes `(Terms, termsHash, AssetStatus, Decision, decisionRecordId, decisionNonce)` using the artifact-derived ABI (`contract-codec.ts`). Source is `contracts/src/AssetSettlement.sol::getAssetReservation`. Asset obligation is read through `computeAssetObligationId(Terms)`. |
+| Incorrect decision getter layout | **Resolved:** decoder uses Solidity's seven results and binds the transaction ID to the `getDecision` argument (`contract-codec.ts::decodeChainADecision`). Source is `contracts/src/DecisionPaymentSettlement.sol::getDecision`. |
+| Event signatures and indexed fields | **Resolved:** workflow event selectors and decoders use artifact-derived event ABI entries (`workflow.ts::initWorkflow`, `handleLockEvent`, `onDecisionRecorded`). Compatibility tests compare full CRE ABIs with artifacts, including event indexed flags. |
+| Report tuple layouts | **Resolved and receiver-tested:** `report-encoding.ts` encodes all 17 fields in `ProtocolTypes.CoordinationReport` and all 17 fields in `ProtocolTypes.DecisionRelayReport`. The contract suite passes these production CRE payloads into the actual Chain A and Chain B `onReport` functions. |
+| Terms consistency | **Resolved in workflow:** `evaluateLockState` compares all `Terms` fields across Chain A and Chain B and binds event tx ID/hash to Chain A registered terms before evaluating readiness (`workflow.ts::sameProtocolTerms`, `evaluateLockState`). Solidity computes and stores the canonical terms hash in both contracts. |
+| Duplicate settlement | **Verified at contract boundary:** Chain A rejects decisions after the first and performs state/token transfer atomically (`DecisionPaymentSettlement.onReport`, `abort`). Base requires `LOCKED` and then changes to a terminal asset status before transfer (`AssetSettlement.onReport`). Hardhat tests verify duplicate reports do not transfer twice. Workflow also skips a relay when finalized Base state already has the same decision record (`onDecisionRecorded`). |
 
 ## Current safeguards
 
-| Safeguard | Status and evidence |
-|---|---|
-| Lock log address and topic filters | **Verified:** `initWorkflow` configures each EVM log trigger with one configured settlement address and the event topic (`workflow.ts:480-504`). `handleLockEvent` checks the emitting address and topic again (`workflow.ts:327-348`). The client/trigger pairing fixes the source chain to Sepolia or Base Sepolia. |
-| Decision log finality | **Verified:** the `DecisionRecorded` trigger requests `FINALIZED` confidence (`workflow.ts:505-513`), and `onDecisionRecorded` rereads `getDecision` at `LAST_FINALIZED_BLOCK_NUMBER` (`workflow.ts:411-433`, `readAuthoritativeDecision` at `workflow.ts:212-250`). |
-| Removed log handling | **Verified:** handlers return without action for `log.removed` (`workflow.ts:334-337`, `workflow.ts:411-415`). This does not reverse an earlier action if the earlier `SAFE` lock log is later reorganized. |
-| Reservation identity and cross-chain comparison | **Verified with a scope limit:** `evaluateReservationReadiness` checks tx ID, terms hash, buyer/seller, configured chain/contract, token, amount, obligation IDs, expiry, and `LOCKED` status (`domain.ts:135-161`, `domain.ts:168-205`). The expected parties and terms fields passed by `evaluateLockState` are populated from the current reservation reads (`workflow.ts:252-296`), so this proves the two reads are mutually consistent, not that they match an independent user-agreed record. |
-| Event participant and amount | **Verified:** `evaluateLockState` compares the triggering event's participant/amount to the corresponding current reservation before readiness evaluation (`workflow.ts:260-270`). |
-| Unknown enum values | **Verified:** `decodeReservationStatus` and `decodeDecision` throw for unrecognized codes (`workflow.ts:78-104`). |
-| COMMIT readiness | **Verified:** evaluator returns `SUBMIT_COMMIT` only when both reservations are present, matching, `LOCKED`, and unexpired, and the supplied Chain A decision is `UNDECIDED` (`domain.ts:168-205`). **Assumption:** the Chain A consumer independently checks the same conditions and expiry at execution time. |
-| ABORT authority | **Verified in workflow logic:** expiry returns `WAIT_FOR_CHAIN_A_ABORT`; the workflow does not create an ABORT decision (`domain.ts:164-205`). ABORT relay is only selected after a non-UNDECIDED Chain A decision is read (`domain.ts:208-230`). |
-| Existing decision observation | **Verified, but not atomic:** if the Chain A read returns a non-UNDECIDED decision, the readiness evaluator returns `DECISION_ALREADY_RECORDED` and does not construct another COMMIT report (`domain.ts:181-188`). A decision can still be written between that read and a COMMIT report submission. |
-| Write toggle | **Verified:** `enableWrites` defaults to false in `configSchema` (`workflow.ts:65-72`) and the checked-in config sets it to false (`config.json:1-5`). This review does not enable it. |
-| Receiver auth smoke | **Verified only for the isolated smoke receiver:** tests cover unauthorized caller rejection, accepted Forwarder caller, and empty report rejection (`cre-smoke/test/CREReportReceiverSmoke.test.cjs:13-40`). These are not settlement idempotency tests. |
+- Lock triggers are chain-specific, filtered by configured contract and artifact-derived event topic, and use `FINALIZED` confidence (`workflow.ts::initWorkflow`). Callbacks verify emitter/topic, deployment block and ignore removed logs (`handleLockEvent`, `onDecisionRecorded`).
+- Unknown reservation/decision enum values throw. Solidity enum values match the numeric decoder: Decision `0/1/2`; payment and asset states `0/1/2/3`.
+- COMMIT eligibility requires matching, locked, unexpired reservations and an undecided Chain A decision (`domain.ts::evaluateReservationReadiness`). Chain A revalidates local lock, expiry, and the full CoordinationReport at inclusion (`DecisionPaymentSettlement.onReport`).
+- Workflow does not author ABORT. It relays the finalized Chain A decision only, after comparing the source decision block, transaction, terms, destination, and finalized Base reservation state (`workflow.ts::onDecisionRecorded`, `domain.ts::evaluateDecisionRelay`).
+- Chain B checks source/destination bindings, terms, obligation ID, decision record ID/nonce, participants, asset, amount, and expiry in `_validateDecisionReport` (`AssetSettlement.sol`).
+- `local-simulation` cannot select production CRE writes; local broadcast is separately opt-in and requires the configured test receiver's `trustedForwarder` to equal the chain-specific mock Forwarder. `production-cre` rejects local broadcast config. Production writes remain disabled.
+- Reconciliation is manually triggered with an authorized HTTP trigger in production mode and a CLI-supplied HTTP payload in simulation; state and reports are reconstructed from finalized contract state and immutable Chain A decision records.
+- A successful report receiver execution is followed by independent latest-state reads on both chains; this is a verification check, not a claim of finality. Finalized state must be checked again before declaring settlement complete.
 
-CRE's official overview describes each trigger as starting a fresh independent execution and callbacks as stateless, with no persistent state between executions ([CRE overview](https://docs.chain.link/cre/overview)). The EVM Write documentation describes a signed report delivered through a Keystone Forwarder to the consumer's `onReport` entry point ([EVM Read & Write](https://docs.chain.link/cre/capabilities/evm-read-write)). The workflow must therefore rely on on-chain state for durable idempotency and settlement truth.
+## Outstanding failure scenarios
 
-## Failure scenario matrix
+| Scenario | Current behavior and remaining risk | References |
+|---|---|---|
+| Duplicate lock callback | The workflow has no persistent event dedupe key and can submit repeated Chain A reports while a prior report is pending. Chain A write-once validation prevents a second payment/decision; the duplicate may revert and surface as a failed execution. | `workflow.ts::evaluateLockState`; `DecisionPaymentSettlement.sol::onReport` |
+| Duplicate decision callback | `onDecisionRecorded` checks finalized Base state and returns `RELAY_ALREADY_APPLIED` for the same record. If an earlier Base report is not yet finalized, a repeated report may still be submitted; Base's status guard prevents a second transfer. | `workflow.ts::onDecisionRecorded`; `AssetSettlement.sol::onReport` |
+| Missed event or transient read failure | Manual reconciliation now accepts a transaction ID, rereads finalized current state on both chains and either evaluates matching undecided locks or relays the immutable finalized Chain A decision. It is safe to repeat; automated discovery/backfill of unknown transaction IDs is not implemented. | `workflow.ts::onReconcile`, `onDecisionRecorded` |
+| Permissionless ABORT races COMMIT | Workflow readiness and report submission are separate. Chain A resolves the race atomically at inclusion: COMMIT requires `block.timestamp < expiresAt`; ABORT requires `block.timestamp >= expiresAt`; both require UNDECIDED, so only the first valid decision wins. Existing tests cover boundary rejection and write-once behavior, not simultaneous mempool ordering. | `DecisionPaymentSettlement.sol::onReport`, `abort`; `settlement.test.ts` |
+| Source finalized read unavailable | `.result()` failure propagates; workflow does not fall back to latest. This is fail-closed but there is no later reconciliation guarantee if the callback is not rerun. | `workflow.ts::readAuthoritativeDecision`, `onDecisionRecorded` |
+| Destination write included but not finalized | Callbacks now fail on `UNKNOWN`/non-success receiver status and reread latest source and destination state after writes. Latest state is not a finality guarantee. Transaction hash and independent finalized reads are required before declaring settlement complete. | `report-write.ts::writeCreReport`; `workflow.ts::verifyCommitAfterWrite`, `verifyRelayAfterWrite` |
+| Finalized lock event is reorganized | Removed logs are ignored; reads use finalized state and Chain A rechecks current conditions at inclusion. A prior callback is not compensated, but reconciliation re-reads authoritative state and contracts remain atomic/idempotent. Live deployed CRE behavior is not tested. | `workflow.ts::handleLockEvent`; `DecisionPaymentSettlement.sol::onReport` |
 
-| Scenario | Current behavior | Reliability impact | Status / code reference |
-|---|---|---|---|
-| Duplicate `PaymentLocked` or `AssetLocked` trigger | Each execution rereads both reservations and Chain A decision. If the read still says `UNDECIDED`, each execution may submit the same COMMIT report when writes are enabled. No `(chainId, txHash, logIndex)` or transaction-level dedupe is stored. | Duplicate report submissions are possible. Whether they can charge/settle twice depends on Chain A's atomic write-once guard and receiver behavior. | **Verified gap:** `handleLockEvent`, `evaluateLockState` (`workflow.ts:252-325`, `327-391`); no durable state in `domain.ts`. |
-| Duplicate `DecisionRecorded` trigger / retried callback | Each execution rereads Chain A decision and constructs the relay report from that state. No local/remote relay marker is checked. | Same decision can be sent to Base repeatedly. Destination must handle duplicates idempotently by decision/transaction identity. | **Verified gap:** `onDecisionRecorded` (`workflow.ts:411-478`), `evaluateDecisionRelay` (`domain.ts:208-230`). |
-| Lock event occurs before workflow activation, trigger delivery is missed, or callback fails | Only event triggers exist for locks and decisions. There is no timer, scan, cursor, retry queue, or reconciliation handler in `initWorkflow`. | No code path discovers the missed event or re-evaluates the transaction unless another relevant event is delivered. Whether the CRE trigger service replays any event range is not specified in this repository; do not treat replay as a guarantee. | **Verified gap:** `initWorkflow` registers only three log handlers (`workflow.ts:480-516`). |
-| One lock callback runs before the other chain's reservation is visible | Both reads occur in one callback, but the chains are read independently at unspecified/latest heights. Missing reservation returns a wait action. There is no later poll if no further event fires. | Transaction can remain eligible but unprocessed after a temporary cross-chain visibility/read timing issue. | **Verified gap:** `evaluateLockState` reads both (`workflow.ts:252-262`); evaluator returns `WAIT_FOR_RESERVATIONS` (`domain.ts:196-198`); no reconciliation trigger. |
-| SAFE lock log is reorganized after callback | `log.removed` is ignored when observed. Trigger confidence is `SAFE`, not `FINALIZED`; prior callback effects are not reverted or compensated by the removed-log handler. | A report may have been submitted using a reservation later reverted from the source chain. Chain A must validate actual reservation state atomically; otherwise there is reorg exposure. | **Verified:** confidence in `initWorkflow` (`workflow.ts:484-504`); removed-log handling (`workflow.ts:334-337`). Contract response is an **assumption**. |
-| COMMIT report and permissionless expiry ABORT race | Evaluator checks runtime wall-clock seconds before building the report. Chain A report is a later EVM transaction. A permissionless abort may execute in between; there is no lock/lease in workflow. | Both attempts may be submitted. Correctness requires Chain A to atomically accept exactly one decision, check expiry and reservation states at inclusion, and make the loser harmless/revert without state change. | **Verified race window:** `evaluateLockState` (`workflow.ts:290-317`), expiry check (`domain.ts:190-205`). On-chain guarantee is **unverified**. |
-| Chain A decision already exists when COMMIT readiness runs | A non-UNDECIDED read prevents the workflow from constructing a COMMIT report. | This avoids an intentional overwrite when the read sees the decision. It does not close the read/write race or prove the receiver cannot overwrite an existing decision. | **Verified guard:** `evaluateReservationReadiness` (`domain.ts:181-188`). **Assumption:** Chain A write-once state transition. |
-| Chain A becomes COMMIT, but Base relay is delayed or never delivered | `DecisionRecorded` is the only relay trigger. It reads finalized state and writes once per callback; no retry/reconciliation schedule is configured. | Chain A can be committed while Base remains locked. The UI/application may stay inconsistent unless it independently reads both chains or a new trigger retries the relay. | **Verified gap:** `onDecisionRecorded` (`workflow.ts:411-478`), `initWorkflow` has no scheduled handler (`workflow.ts:480-516`). |
-| `LAST_FINALIZED_BLOCK_NUMBER` cannot be read | `readAuthoritativeDecision(..., true).result()` propagates capability/read failure. No fallback to latest is used, which avoids making a relay decision from an unfinalized read. No explicit catch, retry policy, or later reconciliation exists here. | Safe stop for that execution, but liveness depends on CRE/runtime redelivery or another event. That behavior has not been verified in this project. | **Verified:** `readAuthoritativeDecision` (`workflow.ts:212-237`); **missing recovery:** `onDecisionRecorded` (`workflow.ts:430`). |
-| Finalized event and state read differ | Handler checks event decision equals the finalized `getDecision` value, then checks transaction/terms and source/destination bindings (`workflow.ts:429-444`, `domain.ts:208-230`). | Mismatch throws or rejects and avoids relay. It does not check that returned obligation IDs match current reservations or that `recordId` corresponds to the specific event; the event ABI has no record ID. | **Verified limit:** `DECISION_RECORDED_ABI` (`workflow.ts:27-29`), `evaluateDecisionRelay` (`domain.ts:208-230`). Contract record semantics are **assumptions**. |
-| EVM Write response has `UNKNOWN` receiver execution status | Adapter throws on non-success tx status or explicit receiver revert, but returns `UNKNOWN` otherwise (`report-write.ts:42-56`). Both main callbacks log that value and return their business action without requiring `SUCCESS` (`workflow.ts:312-324`, `466-478`). | Callback result can appear successful although receiver execution is unconfirmed. Even `SUCCESS` in the capability response is not followed by a destination finalized state read. | **Verified gap:** cited adapter/callbacks. |
-| Destination transaction is included but later reorganized or consumer state is not as expected | Workflow logs tx hash and receiver execution response; it does not poll a destination receipt to finality or reread consumer state. | Inclusion/capability success is not destination finality or proof that settlement is complete. An application must not label the trade complete from this callback result alone. | **Verified gap:** `writeCreReport` (`report-write.ts:32-56`), `onDecisionRecorded` (`workflow.ts:449-478`). |
-| Stored reservation fields agree with each other but differ from user-agreed terms | `termsHash` from the event is compared to the two reservation terms hashes. Buyer/seller/token/amount/obligation/expiry expected values are largely seeded from the reservations themselves. No canonical terms input or hash recomputation is present. | Cross-chain equality is checked, but the workflow alone does not prove the records encode the terms shown/accepted by the user. The contracts may guarantee this; not verified. | **Verified limit:** `evaluateLockState` (`workflow.ts:272-288`), `matchesTerms` (`domain.ts:135-161`). |
-| Retry after uncertain write result | Callback may throw on explicit error or continue on unknown execution status. No transaction/report idempotency key or destination-state query is used to determine whether the earlier write took effect. | Blind retry can duplicate a report; not retrying can leave a decision unrelayed. Contract idempotency is mandatory. | **Verified gap:** `writeCreReport` (`report-write.ts:42-56`), no durable tracking in workflow. |
+## Tests and validation
 
-## Missed events, retries, and in-memory state
+- Existing Hardhat suite: **15 passing** before this execution-mode adaptation; it covers generated ABI equality, getter decoding, matching terms hashes, production report encoders passed through actual receivers, and duplicate settlement rejection.
+- CRE workflow: `bun run typecheck` passed after the adaptation.
+- CRE workflow safety/reconciliation tests: `bun test` passed, **5 tests** (mode separation, invalid configuration, missed-event readiness, retry after failed relay, already-applied/conflicting destination decision).
+- Contract compile/typecheck and full Hardhat suite are to be rerun after this change; results will be recorded below after execution.
+- Frontend TypeScript/build have not been rerun in this adaptation. UI files were not changed.
+- CLI v1.39.0 is installed and supports simulation `--broadcast`. Demo contract/token addresses are now configured, but no full workflow run against initialized, matching reservations and finalized lock events has been performed.
 
-- **Duplicate delivery:** The workflow does not deduplicate trigger events. Repeated executions recompute from chain reads and can re-submit a report. Repeated report delivery is safe only if the receiver is idempotent.
-- **Missed-event recovery:** None is implemented. There is no scheduled scan of undecided/reserved transactions or finalized Chain A decisions lacking Base completion, and no event-range cursor/backfill. CRE trigger delivery/replay guarantees were not established from the checked-in artifacts, so they remain an operational question rather than a safeguard.
-- **Re-execution safety:** Callbacks are deterministic in the sense that they derive actions from current chain reads and configured addresses, but they are not exactly-once. Chain state can change between reads and writes. Re-execution is safe only with contract-enforced write-once decisions and duplicate-safe Base consumption.
-- **Existing Chain A decision:** Workflow observation prevents it from intentionally submitting COMMIT after seeing an existing decision. It does not itself enforce write-once; the race between read and report submission remains. ABORT is never authored by this workflow.
-- **Relay identity:** A retry reads `getDecision(transactionId)` and encodes the returned tx ID, terms hash, obligation IDs, decision, and record ID. The relay evaluator checks tx ID/terms/source/destination but not obligation IDs against independent reservation state. Stable retry identity depends on `getDecision` being immutable after the first decision and the `recordId` being stable.
-- **Chain A COMMIT followed by delayed Base relay:** Chain A remains the authority. The Base relay can be retried from the same finalized decision if a trigger is redelivered, but there is no new periodic retry path. Until Base consumes the report, the two chains can show different states. App status must represent “Chain A decided; Base pending” rather than “settled.”
-- **Source finality unavailable:** The handler errors on the finalized read and does not fall back to an unfinalized value. This preserves decision safety but does not ensure eventual relay; recovery is missing.
-- **Inclusion vs finality:** `txHash` plus a successful adapter response is evidence about the write operation's reported outcome, not a destination-finalized settlement status. Current code does not await destination finality or verify an on-chain completion getter/event.
-- **Workflow-only state:** There is no workflow memory state by design. Trigger payload and intermediate values are local variables only. Durable transaction/decision/relay status must come from the settlement contracts or an existing application-owned status source. No database or new infrastructure is recommended for the current scope.
+The unit/Hardhat checks and deployment verification do not prove CRE DON consensus or live settlement. Testnet deployments were performed, but no CRE report transaction was broadcast.
 
-## Missing safeguards
+## Recommended next steps
 
-1. **No destination idempotency verification.** The workflow has no acknowledgement/state read to distinguish “not applied” from “applied, response lost.”
-2. **No reconciliation trigger.** Event-only progression creates a liveness gap after missed events, temporary capability failures, or delayed Base execution.
-3. **No canonical terms verification.** The two chain reads agree against values derived from the reads, but the workflow does not load/recompute the canonical user-approved terms hash.
-4. **No chain-state pinning across reads.** Payment, asset, and decision reads use no common or recorded block references; they may reflect different heights. Contract-side validation must close state races.
-5. **No finalized verification of reservation locks.** Lock triggers use `SAFE`, and the reservation reads are not pinned to finalized block numbers. A removed log is ignored, not compensated.
-6. **No validation of decision obligation IDs against expected reservations before relay.** They are forwarded from Chain A decision state.
-7. **Unknown receiver status is non-fatal in the main workflow.** The adapter exposes `UNKNOWN`, but commit and relay callbacks proceed to return their action.
-8. **No status vocabulary separating report submission, destination execution, and final settlement.** Callback action strings can be mistaken for completed application state.
-9. **No reliability tests for the pure evaluator or callbacks.** The only checked-in tests are for the isolated smoke receiver; no workflow/domain test suite is present. `config.json` contains zero-address placeholders and `enableWrites=false`, so no settlement workflow integration result is recorded.
+1. Seed and fund demo participants, create matching reservations and finalized lock events, then run local simulation reads and dry-run reports.
+2. Before any local `--broadcast`, replace the configured CRE signer: the current `CRE_ETH_PRIVATE_KEY` resolves to a publicly known demo account and must not be used or funded. Use a separately configured/funded test signer and verify receiver Forwarder bindings.
+3. If test broadcast is explicitly desired, submit only to the isolated mock-Forwarder receivers and independently verify transaction hashes and finalized state.
+4. Keep production writes disabled pending tenant DON deployment access.
 
-## Recommended minimal changes
+## Contract implementation facts and remaining questions
 
-These are recommendations only; no changes were made in this review.
+Verified in current source/tests:
 
-### Workflow
+- Chain A decision is write-once; ABORT is permissionless after expiry, including when payment was never locked.
+- Chain A COMMIT plus payment is atomic; a failed token transfer leaves the decision undecided.
+- Chain B refuses to release an asset based only on local expiry and rejects duplicate decision processing.
+- The current Chain B decision record nonce is `1`, and its record ID is derived from source chain/contract, transaction ID, terms hash, decision, and nonce.
 
-1. Add a lightweight scheduled reconciliation handler that reads authoritative on-chain state for configured/pending transaction IDs or a bounded event range, then re-evaluates and replays reports. Use only existing contract state/events and CRE capabilities; do not add a database. The exact enumeration mechanism depends on Dev 2's implemented contract interface. If the contract cannot enumerate pending transaction IDs or decision records, document how the application supplies a bounded set.
-2. Treat workflow outputs as action states such as `COMMIT_REPORT_SUBMITTED` / `BASE_RELAY_SUBMITTED`, not as settlement completion. Keep “complete” dependent on finalized destination state readback.
-3. Fail the execution or mark it explicitly pending when receiver execution is `UNKNOWN`; do not report relay success from an unknown response.
-4. Where supported by the finalized read/trigger semantics, compare the `DecisionRecorded` event's block reference to the authoritative decision record or use a stable on-chain decision record ID included in the event/getter. Avoid inventing an event signature: agree it with Dev 2 first.
-5. Before relay, verify that Chain A decision obligation IDs match the reservation/contract's authoritative obligation identifiers. Exact getters and available enumeration must come from Dev 2's contract implementation.
-6. Bind expected buyer, seller, token, amount, expiry, and obligation IDs to a canonical terms source already used by the application, or have the contract prove that these fields hash to `termsHash`. Do not create a second terms encoding independently.
-7. Keep finality failures fail-closed, but ensure the reconciliation path can retry them. Do not silently fall back from `LAST_FINALIZED_BLOCK_NUMBER` to latest.
+Still requiring operational input or an explicit product decision:
 
-### Settlement contracts
-
-1. Chain A must enforce an atomic write-once decision transition: accept COMMIT only while undecided, before expiry, with both valid reservations; accept permissionless ABORT only while undecided and after expiry. The state transition and payment execution must be atomic as specified by the protocol.
-2. Duplicate reports must be idempotent. A repeated report for the same transaction/decision/record ID should not repeat payment or asset transfer. Conflicting decisions or misbound reports must revert without changing settlement state.
-3. Base must persist a consumed decision/record reference per transaction and make duplicate delivery a harmless no-op/rejection. It must validate source chain/contract, destination, transaction, terms, asset obligation, and decision before moving assets.
-4. Expose enough authoritative state/event data for reconciliation to determine whether payment execution, asset delivery/release, and decision relay have completed. The review does not prescribe getter names or signatures.
-
-## Tests needed
-
-No tests were added or run for this review. Before enabling writes, add tests against the actual contract ABI and implementation for:
-
-1. Duplicate delivery of identical Chain A COMMIT report causes at most one payment execution.
-2. Duplicate Base COMMIT and ABORT reports cause at most one asset delivery/release.
-3. Same transaction ID with different terms hash, decision record, source/destination binding, or obligation IDs is rejected.
-4. COMMIT vs permissionless expiry ABORT race: whichever transaction is validly accepted first is write-once; the other cannot overwrite or execute settlement.
-5. COMMIT just before expiry with report mined after expiry follows the contract's explicitly agreed inclusion-time rule.
-6. Repeated and out-of-order `PaymentLocked`, `AssetLocked`, and `DecisionRecorded` deliveries converge to the same state.
-7. A removed/reorged SAFE lock event cannot cause payment or asset settlement; finalized decision relay is only based on finalized Chain A state.
-8. Finalized source read unavailable, callback error, unknown receiver status, explicit receiver revert, and lost/ambiguous write response are distinguishable and recoverable.
-9. Delayed Base relay is eventually recovered by reconciliation, and the application continues to display Chain A decided / Base pending until Base finality is verified.
-10. Workflow evaluator tests for mismatched tx ID/terms hash/participants/token/amount/obligation/expiry/status, existing COMMIT/ABORT, expiry boundary, missing reservations, and malformed enum values.
-11. Report ABI encoding tests against Dev 2's published ABI, plus an EVM Write receiver test that exercises the actual settlement consumer and duplicate semantics (the current smoke receiver test does not cover these).
-
-## Questions for Developer 2
-
-1. Does Chain A atomically check `UNDECIDED`, reservation statuses, and `block.timestamp < expiresAt` before accepting COMMIT and executing payment? What is the exact race behavior if permissionless ABORT wins first?
-2. Is decision state strictly write-once? How are repeated identical reports handled? What happens to a conflicting COMMIT/ABORT report?
-3. Does the Chain A decision record have a stable ID/nonce and immutable tx ID, terms hash, obligation IDs, and decision? Can the `DecisionRecorded` event identify that same record?
-4. Which chain timestamp defines expiry, and is the boundary `>= expiresAt` for ABORT and `< expiresAt` for COMMIT?
-5. How does Chain B prevent duplicate asset transfer/release across repeated EVM Write callbacks? What durable consumed key does it record?
-6. Which exact fields does the Base receiver validate, including source chain, source contract, destination chain/contract, terms hash, obligation ID, and record ID?
-7. What on-chain read/event can prove payment executed and Base delivered/released assets, and are those states terminal/finalized?
-8. Can the contracts enumerate unresolved reservations/decisions or emit enough indexed events for bounded reconciliation without off-chain storage?
-9. Do reservation getters return missing/terminal states explicitly, and can their fields be trusted as the canonical terms hashed by the user-facing flow?
-10. What is the final ABI and enum mapping for events, getters, and report payloads? `CONTRACT_INTERFACES.md` is currently marked proposal and must not be treated as implementation evidence.
-
-## Review boundary
-
-The repository contains the CRE coordinator proposal, the isolated smoke receiver, and its local receiver tests; it does not contain Dev 2's settlement contracts or deployed addresses. Consequently, this review verifies workflow-side behavior but cannot certify atomic settlement, contract idempotency, exact ABI compatibility, or eventual destination completion. Main settlement writes remain disabled in `raisinFi/my-workflow/config.json`.
+- Buyer/seller demo wallet addresses, token funding, matching reservation/lock transactions, and a fresh local simulator signer before any test broadcast.
+- CRE deployment access and an observed live receiver transaction.
+- Automated discovery/backfill of unknown transaction IDs is not implemented; current reconciliation is manual per supplied ID.
+- UI labels distinguishing local simulation/test-relayer from DON execution remain unimplemented because Dev 2's UI files were intentionally not changed.
+- Arkiv access key for reliable evidence publication beyond rate-limited public endpoint use.

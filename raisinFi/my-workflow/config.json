@@ -1,5 +1,13 @@
 {
-  "paymentContractAddress": "0x0000000000000000000000000000000000000000",
-  "assetContractAddress": "0x0000000000000000000000000000000000000000",
-  "enableWrites": false
+  "executionMode": "local-simulation",
+  "paymentContractAddress": "0x46474063C039f76111d0a393B8266E377dF7b8e8",
+  "assetContractAddress": "0x9DbFA23d09deb3A66a7261de9E7e708A1b9bBc1A",
+  "paymentTokenAddress": "0x94420ff404238419452Eb8f25Ddb002e7Aa2a7e5",
+  "assetTokenAddress": "0x5050Badc7279A059AFC0CDb04d1a63cEFfa0CAaF",
+  "paymentDeploymentBlock": 12078072,
+  "assetDeploymentBlock": 55338217,
+  "paymentForwarderAddress": "0x15fC6ae953E024d975e77382eEeC56A9101f9F88",
+  "assetForwarderAddress": "0x82300bd7c3958625581cc2f77bc6464dcecdf3e5",
+  "localBroadcastEnabled": false,
+  "productionWritesEnabled": false
 }
