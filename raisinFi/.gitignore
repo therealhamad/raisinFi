@@ -1,0 +1,6 @@
+*.env
+node_modules/
+dist/
+.cre_build_tmp.js
+artifacts/
+cache/

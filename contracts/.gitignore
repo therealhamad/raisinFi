@@ -1,0 +1,8 @@
+node_modules/
+artifacts/
+cache/
+dist/
+coverage/
+types/
+.env
+deployments/

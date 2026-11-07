@@ -1,0 +1,49 @@
+# ==========================================================================
+# CRE WORKFLOW SETTINGS FILE
+# ==========================================================================
+# Workflow-specific settings for CRE CLI targets.
+# Each target defines user-workflow and workflow-artifacts groups.
+# Settings here override CRE Project Settings File values.
+#
+# Example custom target:
+# my-target:
+#   user-workflow:
+#     workflow-name: "MyExampleWorkflow"    # Required: Workflow Registry name
+#   workflow-artifacts:
+#     workflow-path: "./main.ts"            # Path to workflow entry point
+#     config-path: "./config.yaml"          # Path to config file
+#     secrets-path: "../secrets.yaml"       # Path to secrets file (project root by default)
+
+# ==========================================================================
+staging-settings:
+  user-workflow:
+    workflow-name: "raisinfi-transaction-coordinator"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: ""
+
+local-simulation:
+  user-workflow:
+    workflow-name: "raisinfi-transaction-coordinator-local"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: ""
+
+# Production config remains separately gated; productionWritesEnabled must stay false until approved.
+production-settings:
+  user-workflow:
+    workflow-name: "raisinfi-transaction-coordinator"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.production-cre.json"
+    secrets-path: ""
+
+cre-write-smoke:
+  user-workflow:
+    workflow-name: "raisinfi-cre-write-smoke"
+  workflow-artifacts:
+    workflow-path: "./smoke-main.ts"
+    config-path: "./smoke-config.json"
+    secrets-path: ""
