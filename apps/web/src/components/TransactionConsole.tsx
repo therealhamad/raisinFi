@@ -27,6 +27,7 @@ import { getContractAddresses } from "@/lib/contracts";
 import { buildAgreementDraft, type AgreementDraft } from "@/lib/agreement-draft.ts";
 import { deduplicateFinalizedLogs, scanSepoliaFinalizedLogs, SEPOLIA_LOG_CHUNK_SIZE } from "@/lib/finalized-logs";
 import { createTransactionId, hashTerms, type Terms } from "@/lib/protocol";
+import { mapUiError, type UiError } from "@/lib/ui-error";
 import { ThemeToggle } from "./ThemeToggle";
 import {
   arkivChain,
@@ -43,7 +44,7 @@ type Snapshot = {
   paymentStatus: bigint;
   assetStatus: bigint | null;
   assetDecision: bigint | null;
-  assetReadError: string | null;
+  assetReadError: UiError | null;
   finalizedTimestamp: bigint;
   lifecycle: {
     agreement: VerifiedReceipt | null;
@@ -54,7 +55,7 @@ type Snapshot = {
     paymentOutcome: VerifiedReceipt | null;
     assetOutcome: VerifiedReceipt | null;
   };
-  lifecycleReadError: string | null;
+  lifecycleReadError: UiError | null;
 };
 
 type VerifiedReceipt = {
@@ -69,7 +70,7 @@ type RegistrationConfirmation = {
   buyer: Address;
   receipt: VerifiedReceipt;
   eventVerified: boolean;
-  eventError: string | null;
+  eventError: UiError | null;
   finalized: boolean;
 };
 
@@ -96,9 +97,9 @@ type AgreementSubmission = {
   terms: Terms;
   termsHash: Hex;
   transactionHash: Hex | null;
-  status: "pending" | "included" | "finalized" | "failed";
+  status: "wallet-action" | "pending" | "included" | "finalized" | "cancelled" | "failed";
   receipt: VerifiedReceipt | null;
-  error: string | null;
+  error: UiError | null;
 };
 
 type VerificationEntry = {
@@ -109,6 +110,8 @@ type VerificationEntry = {
   assetReadError: string | null;
   blockNumber: bigint;
 };
+
+type UserFacingActionError = UiError & { action: string };
 
 type LifecycleLog = {
   transactionHash: Hex | null;
@@ -160,7 +163,16 @@ const assetClient = createPublicClient({
 });
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Unexpected transaction error";
+  return mapUiError(error).technicalMessage;
+}
+
+function actionErrorDetails(error: unknown, action: string, context?: "pending" | "indexing" | "wrongNetwork"): UserFacingActionError {
+  return { ...mapUiError(error, context), action };
+}
+
+function actionErrorWithHash(error: unknown, action: string, transactionHash?: Hex): UserFacingActionError {
+  const mapped = actionErrorDetails(error, action, transactionHash ? "pending" : undefined);
+  return transactionHash && !mapped.transactionHash ? { ...mapped, transactionHash } : mapped;
 }
 
 function findHttpRequestError(error: unknown): HttpRequestError | null {
@@ -188,25 +200,6 @@ function errorReasonFromBody(value: unknown, depth = 0): string | null {
     if (reason) return reason;
   }
   return null;
-}
-
-function transactionErrorMessage(error: unknown): string {
-  const safeText = (value: string) => value.replace(/https?:\/\/[^\s)]+/gi, "[RPC endpoint]");
-  if (error instanceof BaseError) {
-    const revert = error.walk((cause) => cause instanceof ContractFunctionRevertedError);
-    if (revert instanceof ContractFunctionRevertedError) {
-      const reason = revert.reason || revert.data?.errorName || revert.shortMessage;
-      return `Contract simulation reverted: ${safeText(reason)}`;
-    }
-    const httpError = findHttpRequestError(error);
-    if (httpError) {
-      const reason = errorReasonFromBody(httpError.body);
-      const status = httpError.status ? `HTTP ${httpError.status}` : "HTTP request";
-      return `${status}: ${safeText(reason || httpError.shortMessage)}`;
-    }
-    return safeText([error.shortMessage, error.details].filter(Boolean).join(" — "));
-  }
-  return error instanceof Error ? safeText(error.message) : "Unexpected transaction error";
 }
 
 function rpcErrorStatus(error: unknown): number | undefined {
@@ -408,13 +401,39 @@ async function verifyRegistrationReceipt(terms: Terms, termsHash: Hex, receipt: 
   };
 }
 
+function ErrorDetails({ error }: { error: UiError }) {
+  return (
+    <details className="error-details">
+      <summary>Technical details</summary>
+      <p>{error.technicalMessage}</p>
+      {error.name && <p>Name: <code>{error.name}</code></p>}
+      {error.code !== undefined && <p>Code: <code>{String(error.code)}</code></p>}
+      {error.transactionHash && <p>Transaction: <code>{error.transactionHash}</code></p>}
+    </details>
+  );
+}
+
+function UserErrorNotice({ error, role = "alert" }: { error: UiError; role?: "alert" | "status" }) {
+  return <div className="notice error" role={role} aria-live={role === "alert" ? "assertive" : "polite"}><span>{error.message}</span><ErrorDetails error={error} /></div>;
+}
+
+function ActionErrorNotice({ error }: { error: UserFacingActionError }) {
+  return (
+    <div className="notice error" role="alert" aria-live="assertive">
+      <span>{error.message}</span>
+      <small>{error.action}</small>
+      <ErrorDetails error={error} />
+    </div>
+  );
+}
+
 function RegistrationConfirmationNotice({ confirmation }: { confirmation: RegistrationConfirmation }) {
   return (
     <div className={`notice ${confirmation.finalized ? "success" : "warning"}`} role="status" aria-live="polite">
-      <strong>{confirmation.finalized ? "Registration finalized" : "Registration included — awaiting finality"}</strong>
+      <strong>{confirmation.finalized ? "Registration finalized" : confirmation.eventVerified ? "Registration included — awaiting finality" : "Updating agreement status"}</strong>
       <p>Sepolia receipt block {confirmation.receipt.blockNumber.toString()} · Transaction ID <code>{confirmation.transactionId}</code></p>
       {confirmation.eventVerified && <p>Receipt event confirms termsHash <code>{confirmation.termsHash}</code> for buyer <code>{confirmation.buyer}</code>.</p>}
-      {confirmation.eventError && <p>Receipt event verification is still pending: {confirmation.eventError}</p>}
+      {confirmation.eventError && <><p>{confirmation.eventError.message}</p><ErrorDetails error={confirmation.eventError} /></>}
       <a href={`https://sepolia.etherscan.io/tx/${confirmation.receipt.hash}`} target="_blank" rel="noreferrer">View registration receipt {confirmation.receipt.hash} ↗</a>
     </div>
   );
@@ -615,18 +634,19 @@ export function TransactionConsole() {
   const [verificationVisibleCount, setVerificationVisibleCount] = useState(2);
   const [verificationHasMore, setVerificationHasMore] = useState(false);
   const [verificationBusy, setVerificationBusy] = useState(false);
-  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [verificationError, setVerificationError] = useState<UiError | null>(null);
   const [references, setReferences] = useState<TransactionReference[]>([]);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [readError, setReadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<UserFacingActionError | null>(null);
+  const createSubmissionInFlight = useRef(false);
+  const [readError, setReadError] = useState<UiError | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [arkivResult, setArkivResult] = useState<EvidenceResult | null>(null);
   const [arkivBusy, setArkivBusy] = useState(false);
-  const [arkivError, setArkivError] = useState<string | null>(null);
+  const [arkivError, setArkivError] = useState<UiError | null>(null);
   const [preparedDemoReady, setPreparedDemoReady] = useState(false);
   const [preparedDemoCheckBusy, setPreparedDemoCheckBusy] = useState(false);
-  const [preparedDemoCheckError, setPreparedDemoCheckError] = useState<string | null>(null);
+  const [preparedDemoCheckError, setPreparedDemoCheckError] = useState<UiError | null>(null);
   const [preparedDemoVerification, setPreparedDemoVerification] = useState<{ checkedAt: number; blockNumber: bigint; blockTimestamp: bigint } | null>(null);
   const [preparedDemoSubmission, setPreparedDemoSubmission] = useState<{ hash: Hex; status: "pending" | "included" | "success" | "failure" } | null>(null);
   const [registrationConfirmation, setRegistrationConfirmation] = useState<RegistrationConfirmation | null>(null);
@@ -641,7 +661,7 @@ export function TransactionConsole() {
         setChainId(walletState.chainId);
         setIsConnected(walletState.address !== null);
       } catch (error) {
-        setActionError(`Could not read wallet state: ${errorMessage(error)}`);
+        setActionError(actionErrorDetails(error, "Reading wallet state"));
       }
     };
     const onAccountsChanged = (accounts: string[]) => {
@@ -658,7 +678,7 @@ export function TransactionConsole() {
       try {
         setChainId(Number(BigInt(newChainId)));
       } catch (error) {
-        setActionError(`Wallet returned an invalid chain ID: ${errorMessage(error)}`);
+        setActionError(actionErrorDetails(error, "Reading wallet network"));
       }
     };
 
@@ -685,7 +705,7 @@ export function TransactionConsole() {
   const [assetChainInput, setAssetChainInput] = useState(String(baseSepolia.id));
   const [paymentTokenDecimals, setPaymentTokenDecimals] = useState(18);
   const [assetTokenDecimals, setAssetTokenDecimals] = useState(18);
-  const [agreementFormError, setAgreementFormError] = useState<string | null>(null);
+  const [agreementFormError, setAgreementFormError] = useState<UiError | null>(null);
 
   useEffect(() => {
     if (!addresses) return;
@@ -696,7 +716,11 @@ export function TransactionConsole() {
 
   useEffect(() => {
     setAgreementDraft(null);
-    setAgreementSubmission(null);
+    setAgreementSubmission((current) =>
+      current && (current.status === "wallet-action" || current.status === "pending" || current.status === "included")
+        ? current
+        : null,
+    );
   }, [address, sellerInput, paymentChainInput, assetChainInput, paymentInputToken, paymentOutputToken, assetTokenInput, paymentAmountInput, assetAmountInput, expiryMinutesInput, paymentTokenDecimals, assetTokenDecimals]);
 
   const agreementPreview = useMemo(() => {
@@ -778,7 +802,7 @@ export function TransactionConsole() {
       let assetStatus: bigint | null = null;
       let assetDecision: bigint | null = null;
       let assetDecisionRecordId: Hex | null = null;
-      let assetReadError: string | null = null;
+      let assetReadError: UiError | null = null;
 
       try {
         const assetResult = await assetClient.readContract({
@@ -799,7 +823,7 @@ export function TransactionConsole() {
           throw new Error("Finalized Chain B reservation is bound to a different transaction or terms hash");
         }
       } catch (error) {
-        assetReadError = errorMessage(error);
+        assetReadError = mapUiError(error);
       }
 
       const lifecycle = {
@@ -811,7 +835,7 @@ export function TransactionConsole() {
         paymentOutcome: null as VerifiedReceipt | null,
         assetOutcome: null as VerifiedReceipt | null,
       };
-      let lifecycleReadError: string | null = null;
+      let lifecycleReadError: UiError | null = null;
       try {
         const paymentFromBlock = process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK
           ? BigInt(process.env.NEXT_PUBLIC_PAYMENT_DEPLOYMENT_BLOCK)
@@ -960,7 +984,7 @@ export function TransactionConsole() {
           lifecycle.assetOutcome = await verifyEventReceipt(assetClient, log, "Asset outcome");
         }
       } catch (error) {
-        lifecycleReadError = errorMessage(error);
+        lifecycleReadError = mapUiError(error, "indexing");
       }
 
       setSnapshot({
@@ -989,14 +1013,14 @@ export function TransactionConsole() {
       }
       setTransactionIdInput(transactionId);
       if (assetReadError) {
-        setReadError(`Chain A read succeeded; Chain B reservation read failed: ${assetReadError}`);
+        setReadError(actionErrorDetails(new Error(assetReadError.technicalMessage), "Reading Base Sepolia reservation"));
       } else if (lifecycleReadError) {
-        setReadError(`Contract state was read, but lifecycle event verification failed: ${lifecycleReadError}`);
+        setReadError(lifecycleReadError);
       }
     } catch (error) {
       if (includedReceipt && isTransactionNotFound(error)) return;
       setSnapshot(null);
-      setReadError(`Could not read the Chain A transaction: ${errorMessage(error)}`);
+      setReadError(actionErrorDetails(error, "Reading Sepolia transaction"));
     }
   }, [addresses]);
 
@@ -1058,7 +1082,7 @@ export function TransactionConsole() {
         });
       });
     } catch (error) {
-      setVerificationError(errorMessage(error));
+      setVerificationError(mapUiError(error));
     } finally {
       setVerificationBusy(false);
     }
@@ -1095,7 +1119,7 @@ export function TransactionConsole() {
         }
       } catch (error) {
         if (!cancelled) {
-          setVerificationError(discoveryErrorMessage(error));
+          setVerificationError(mapUiError(error));
           setVerificationBusy(false);
         }
       }
@@ -1113,7 +1137,7 @@ export function TransactionConsole() {
       setVerificationEntries([]);
       await loadVerificationBatch(2);
     } catch (error) {
-      setVerificationError(discoveryErrorMessage(error));
+      setVerificationError(mapUiError(error));
     } finally {
       setVerificationBusy(false);
     }
@@ -1137,7 +1161,7 @@ export function TransactionConsole() {
       setChainId(walletState.chainId);
       setIsConnected(walletState.address !== null);
     } catch (error) {
-      setActionError(errorMessage(error));
+      setActionError(actionErrorDetails(error, "Connecting wallet"));
     } finally {
       setIsConnecting(false);
     }
@@ -1159,7 +1183,7 @@ export function TransactionConsole() {
       setChainId(walletState.chainId);
       return true;
     } catch (error) {
-      setActionError(`Could not switch wallet chain: ${errorMessage(error)}`);
+      setActionError(actionErrorDetails(error, "Switching wallet network", "wrongNetwork"));
       return false;
     } finally {
       setIsSwitching(false);
@@ -1175,15 +1199,15 @@ export function TransactionConsole() {
       setPreparedDemoCheckError(null);
       setPreparedDemoCheckBusy(false);
       if (!addresses) {
-        setPreparedDemoCheckError("Configure the deployed contract addresses before registration.");
+        setPreparedDemoCheckError(mapUiError(new Error("Contract configuration is unavailable.")));
         return;
       }
       if (!address || address.toLowerCase() !== PREPARED_DEMO_BUYER.toLowerCase()) {
-        setPreparedDemoCheckError("Connect Alice’s wallet to enable this registration.");
+        setPreparedDemoCheckError(mapUiError(new Error("Connect Alice’s wallet to enable this registration.")));
         return;
       }
       if (chainId !== sepolia.id) {
-        setPreparedDemoCheckError("Select Ethereum Sepolia (chain ID 11155111) in Coinbase Wallet.");
+        setPreparedDemoCheckError(mapUiError(new Error("Wrong network selected")));
         return;
       }
 
@@ -1262,7 +1286,7 @@ export function TransactionConsole() {
           setPreparedDemoReady(true);
         }
       } catch (error) {
-        if (!cancelled) setPreparedDemoCheckError(`Prepared registration is not ready: ${errorMessage(error)}`);
+        if (!cancelled) setPreparedDemoCheckError(mapUiError(error));
       } finally {
         if (!cancelled) setPreparedDemoCheckBusy(false);
       }
@@ -1386,14 +1410,14 @@ export function TransactionConsole() {
       const message = errorMessage(error);
       if (!submittedHash) {
         setPreparedDemoReady(false);
-        setPreparedDemoCheckError(`Prepared registration could not continue: ${message}`);
+        setPreparedDemoCheckError(mapUiError(new Error(message)));
       }
       if (receiptIncluded) {
         setActionError(null);
       } else {
         setActionError(submittedHash && !receiptReverted
-          ? `Transaction submitted; receipt is still pending. ${message}`
-          : message);
+          ? actionErrorWithHash(new Error(message), "Registering prepared agreement", submittedHash)
+          : actionErrorDetails(error, "Registering prepared agreement"));
       }
       if (submittedHash) setPreparedDemoSubmission({ hash: submittedHash, status: receiptReverted ? "failure" : receiptIncluded ? "included" : "pending" });
     } finally {
@@ -1459,7 +1483,7 @@ export function TransactionConsole() {
         : current);
     } catch (error) {
       setRegistrationConfirmation((current) => current?.receipt.hash.toLowerCase() === receipt.hash.toLowerCase()
-        ? { ...current, eventError: errorMessage(error) }
+        ? { ...current, eventError: mapUiError(error, "indexing") }
         : current);
     }
   }
@@ -1498,6 +1522,10 @@ export function TransactionConsole() {
   async function createTransaction(event: FormEvent<HTMLFormElement>, preparedDraft?: AgreementDraft) {
     event.preventDefault();
     if (!address || !addresses) return;
+    if (createSubmissionInFlight.current) return;
+    if (agreementSubmission?.status === "wallet-action" || agreementSubmission?.status === "pending" || agreementSubmission?.status === "included") return;
+    let submittedHash: Hex | undefined;
+    createSubmissionInFlight.current = true;
     setActionError(null);
     setSuccessMessage(null);
     setBusyAction("create");
@@ -1524,7 +1552,7 @@ export function TransactionConsole() {
         assetSettlement: addresses.asset,
       });
       const { terms, termsHash } = draft;
-      setAgreementSubmission({ terms, termsHash, transactionHash: null, status: "pending", receipt: null, error: null });
+      setAgreementSubmission({ terms, termsHash, transactionHash: null, status: "wallet-action", receipt: null, error: null });
       if (terms.buyer.toLowerCase() !== address.toLowerCase()) {
         throw new Error("The connected buyer account changed after preview. Review the updated Terms.");
       }
@@ -1551,6 +1579,7 @@ export function TransactionConsole() {
           account: address,
         }),
       });
+      submittedHash = hash;
       setAgreementSubmission({ terms, termsHash, transactionHash: hash, status: "pending", receipt: null, error: null });
       const receipt = await waitForSuccess(sepolia.id, hash, terms.transactionId, terms.paymentContract);
       recordReceipt(sepolia.id, terms.transactionId, terms.paymentContract, "Agreement registered", receipt);
@@ -1562,15 +1591,33 @@ export function TransactionConsole() {
       await refreshTransaction(terms.transactionId, receipt);
       setAgreementSubmission({ terms, termsHash, transactionHash: hash, status: "finalized", receipt, error: null });
     } catch (error) {
-      const message = error instanceof Error && (error.name === "UserRejectedRequestError" || /user rejected|user denied|request rejected/i.test(error.message))
-        ? "Registration was rejected in the wallet. No agreement was registered."
-        : errorMessage(error);
+      const technical = errorMessage(error);
+      const isPendingAfterBroadcast = Boolean(submittedHash) && !/revert|failed receipt|execution reverted/i.test(technical);
+      const mapped = actionErrorDetails(
+        error,
+        "Registering agreement",
+        isPendingAfterBroadcast ? "pending" : undefined,
+      );
+      const mappedWithHash = submittedHash && !mapped.transactionHash
+        ? { ...mapped, transactionHash: submittedHash }
+        : mapped;
       setAgreementSubmission((current) => current && current.status !== "finalized"
-        ? { ...current, status: /reverted|failed receipt/i.test(message) ? "failed" : current.status, error: message }
+        ? {
+            ...current,
+            status: mappedWithHash.message === "Signature cancelled" && !submittedHash
+              ? "cancelled"
+              : submittedHash && !current.receipt
+                ? current.status
+                : mappedWithHash.message === "Something went wrong. Please try again."
+                  ? "failed"
+                  : current.status,
+            error: mappedWithHash,
+          }
         : current);
-      setAgreementFormError(message);
-      setActionError(message);
+      setAgreementFormError(mappedWithHash);
+      setActionError(mappedWithHash);
     } finally {
+      createSubmissionInFlight.current = false;
       setBusyAction(null);
     }
   }
@@ -1698,7 +1745,7 @@ export function TransactionConsole() {
       await refreshTransaction(snapshot.terms.transactionId);
       setSuccessMessage("Payment reservation confirmed on Ethereum Sepolia.");
     } catch (error) {
-      setActionError(transactionErrorMessage(error));
+      setActionError(actionErrorDetails(error, "Locking payment"));
     } finally {
       setBusyAction(null);
     }
@@ -1747,7 +1794,7 @@ export function TransactionConsole() {
       await refreshTransaction(snapshot.terms.transactionId);
       setSuccessMessage("Asset reservation confirmed on Base Sepolia.");
     } catch (error) {
-      setActionError(errorMessage(error));
+      setActionError(actionErrorDetails(error, "Locking asset"));
     } finally {
       setBusyAction(null);
     }
@@ -1781,7 +1828,7 @@ export function TransactionConsole() {
       await refreshTransaction(snapshot.terms.transactionId);
       setSuccessMessage("Chain A recorded ABORT. Any locked Base asset remains reserved until CRE relays ABORT.");
     } catch (error) {
-      setActionError(errorMessage(error));
+      setActionError(actionErrorDetails(error, "Recording expiry decision"));
     } finally {
       setBusyAction(null);
     }
@@ -1944,7 +1991,7 @@ export function TransactionConsole() {
         record.created ? "Public Arkiv evidence created and retrieved." : "Existing Arkiv evidence retrieved.",
       );
     } catch (error) {
-      setArkivError(errorMessage(error));
+      setArkivError(mapUiError(error));
     } finally {
       setArkivBusy(false);
     }
@@ -1959,7 +2006,7 @@ export function TransactionConsole() {
       if (!result) throw new Error("No Arkiv entity matches this transaction ID");
       setArkivResult(result);
     } catch (error) {
-      setArkivError(errorMessage(error));
+      setArkivError(mapUiError(error));
     } finally {
       setArkivBusy(false);
     }
@@ -1968,7 +2015,7 @@ export function TransactionConsole() {
   async function loadTransaction(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!/^0x[0-9a-fA-F]{64}$/.test(transactionIdInput)) {
-      setReadError("Transaction ID must be a 32-byte hex value");
+      setReadError(mapUiError(new Error("Transaction ID must be a 32-byte hex value")));
       return;
     }
     setReadError(null);
@@ -2159,7 +2206,7 @@ export function TransactionConsole() {
                       </dl>
                       <LifecycleReceipt chainId={baseSepolia.id} receipt={snapshot.lifecycle.assetLock} label="Asset lock receipt" />
                       {assetFailed && <FailedReceipt references={references} chainId={baseSepolia.id} transactionId={snapshot.terms.transactionId} />}
-                      {snapshot.assetReadError && <p className="lifecycle-error">Chain B read failed: {snapshot.assetReadError}</p>}
+                      {snapshot.assetReadError && <p className="lifecycle-error">Chain B read failed: {snapshot.assetReadError.message}</p>}
                     </article>
                   </div>
                 ) : (
@@ -2220,7 +2267,7 @@ export function TransactionConsole() {
                 ) : (
                   <p className="lifecycle-empty">Decision and relay details are shown only after finalized chain state is loaded.</p>
                 )}
-                {snapshot?.lifecycleReadError && <p className="lifecycle-error">Receipt verification issue: {snapshot.lifecycleReadError}</p>}
+                {snapshot?.lifecycleReadError && <p className="lifecycle-error">Receipt verification issue: {snapshot.lifecycleReadError.message}</p>}
               </div>
             )}
           </article>
@@ -2375,15 +2422,27 @@ export function TransactionConsole() {
             <p className="muted small">Preview is generated locally with the protocol's canonical Terms hash. Registering does not move funds. The wallet will request a separate manual signature after validation and simulation.</p>
             {agreementSubmission && (
               <div className={`notice ${agreementSubmission.status === "finalized" ? "success" : agreementSubmission.status === "failed" ? "error" : "warning"}`} role="status" aria-live="polite">
-                <strong>{agreementSubmission.status === "finalized" ? "Agreement registered and finalized" : agreementSubmission.status === "included" ? "Registration included — finality is not yet confirmed" : agreementSubmission.status === "failed" ? "Registration failed before broadcast" : "Registration submitted — waiting for confirmation"}</strong>
+                <strong>
+                  {agreementSubmission.status === "finalized"
+                    ? "Agreement registered and finalized"
+                    : agreementSubmission.status === "included"
+                      ? "Registration included — finality is not yet confirmed"
+                      : agreementSubmission.status === "wallet-action"
+                        ? "Wallet signature required"
+                        : agreementSubmission.status === "failed"
+                          ? "Registration failed"
+                          : agreementSubmission.status === "cancelled"
+                            ? "Signature cancelled"
+                            : "Transaction submitted — waiting for confirmation"}
+                </strong>
                 <p>Transaction ID: <code>{agreementSubmission.terms.transactionId}</code></p><p>Terms hash: <code>{agreementSubmission.termsHash}</code></p>
                 {agreementSubmission.transactionHash && <p>Wallet transaction: <code>{agreementSubmission.transactionHash}</code></p>}
                 {agreementSubmission.receipt && <p>Included in Sepolia block {agreementSubmission.receipt.blockNumber.toString()}.</p>}
-                {agreementSubmission.error && <p>{agreementSubmission.error}</p>}
+                {agreementSubmission.error && <><p>{agreementSubmission.error.message}</p><ErrorDetails error={agreementSubmission.error} /></>}
                 {agreementSubmission.status === "included" && !agreementSubmission.error && <p>Waiting for the registration to reach finalized Sepolia state; this may take a while.</p>}
               </div>
             )}
-            {agreementFormError && <p className="notice error" role="alert">{agreementFormError}</p>}
+            {agreementFormError && <UserErrorNotice error={agreementFormError} />}
             <div className="form-actions">
               <button className="button secondary" type="button" onClick={() => setActiveActionPanel(null)}>Cancel</button>
               <button className="button secondary" type="button" onClick={() => { if (agreementPreview.draft) setAgreementDraft(agreementPreview.draft); }} disabled={!agreementPreview.draft}>Refresh preview</button>
@@ -2427,7 +2486,9 @@ export function TransactionConsole() {
                   ) : preparedDemoReady ? (
                     <p className="notice success">Ready for Alice’s manual signature. On-chain termsHash and register simulation passed; transaction ID is unregistered.</p>
                   ) : (
-                    <p className="notice warning">{preparedDemoCheckError ?? "Connect Alice’s Coinbase Wallet on Ethereum Sepolia to verify readiness."}</p>
+                    preparedDemoCheckError
+                      ? <UserErrorNotice error={preparedDemoCheckError} role="status" />
+                      : <p className="notice warning">Connect Alice’s Coinbase Wallet on Ethereum Sepolia to verify readiness.</p>
                   )}
                   {preparedDemoVerification && (
                     <p className="muted small">Checked {new Date(preparedDemoVerification.checkedAt).toLocaleTimeString()} · Sepolia block {preparedDemoVerification.blockNumber.toString()} timestamp {new Date(Number(preparedDemoVerification.blockTimestamp) * 1000).toISOString()}</p>
@@ -2446,7 +2507,7 @@ export function TransactionConsole() {
                 )}
                 {(actionError || successMessage) && (
                   <div className="dialog-errors">
-                    {actionError && <p className="notice error" role="alert">{actionError}</p>}
+                    {actionError && <ActionErrorNotice error={actionError} />}
                     {successMessage && <p className="notice success" role="status">{successMessage}</p>}
                   </div>
                 )}
@@ -2531,8 +2592,8 @@ export function TransactionConsole() {
             )}
             {(actionError || readError || successMessage || registrationConfirmation) && (
               <div className="dialog-errors">
-                {actionError && <p className="notice error" role="alert">{actionError}</p>}
-                {activeActionPanel === "open" && readError && <p className="notice error" role="alert">{readError}</p>}
+                {actionError && <ActionErrorNotice error={actionError} />}
+                {activeActionPanel === "open" && readError && <UserErrorNotice error={readError} />}
                 {successMessage && <p className="notice success" role="status">{successMessage}</p>}
                 {registrationConfirmation && <RegistrationConfirmationNotice confirmation={registrationConfirmation} />}
               </div>
@@ -2541,8 +2602,8 @@ export function TransactionConsole() {
         </dialog>
       )}
 
-      {!activeActionPanel && actionError && <div className="notice error" role="alert">{actionError}</div>}
-      {!activeActionPanel && readError && <div className="notice error" role="alert">{readError}</div>}
+      {!activeActionPanel && actionError && <ActionErrorNotice error={actionError} />}
+      {!activeActionPanel && readError && <UserErrorNotice error={readError} />}
       {!activeActionPanel && successMessage && <div className="notice success" role="status">{successMessage}</div>}
       {!activeActionPanel && registrationConfirmation && <RegistrationConfirmationNotice confirmation={registrationConfirmation} />}
 
@@ -2609,7 +2670,7 @@ export function TransactionConsole() {
               >
                 {busyAction === "asset" ? "Locking asset…" : "Bob: approve and lock asset"}
               </button>
-              {snapshot.assetReadError && <p className="muted small">Asset read detail: {snapshot.assetReadError}</p>}
+              {snapshot.assetReadError && <UserErrorNotice error={snapshot.assetReadError} role="status" />}
             </article>
           </div>
 
@@ -2653,7 +2714,7 @@ export function TransactionConsole() {
         ) : verificationError && verificationEntries.length === 0 ? (
           <div className="verification-empty verification-error" role="alert">
             <strong>Transaction discovery unavailable</strong>
-            <span>{verificationError}</span>
+            <UserErrorNotice error={verificationError} role="status" />
             <button type="button" className="button secondary" onClick={() => void retryVerificationScan()} disabled={verificationBusy}>Retry scan</button>
           </div>
         ) : verificationEntries.length === 0 ? (
@@ -2681,7 +2742,7 @@ export function TransactionConsole() {
             ))}
           </ul>
         )}
-        {verificationError && verificationEntries.length > 0 && <p className="verification-inline-error" role="alert">{verificationError}</p>}
+        {verificationError && verificationEntries.length > 0 && <div className="verification-inline-error"><UserErrorNotice error={verificationError} /></div>}
         {(verificationEntries.length > verificationVisibleCount || verificationHasMore) && (
           <button
             type="button"
@@ -2755,7 +2816,7 @@ export function TransactionConsole() {
                 <code>{currentArkivResult.status} · {currentArkivResult.decision}</code>
               </div>
             )}
-            {arkivError && <p className="error-text" role="alert">{arkivError}</p>}
+            {arkivError && <UserErrorNotice error={arkivError} />}
           </section>
 
           <section className="evidence-actions-panel" aria-labelledby="evidence-actions-title">
@@ -2839,9 +2900,9 @@ export function TransactionConsole() {
                       {busyAction === "read"
                         ? "Reading finalized chain state and verifying receipts…"
                         : readError
-                          ? `Receipt verification unavailable: ${readError}`
+                          ? `Receipt verification unavailable: ${readError.message}`
                           : snapshot?.lifecycleReadError
-                            ? `Lifecycle receipt verification failed: ${snapshot.lifecycleReadError}`
+                            ? `Lifecycle receipt verification failed: ${snapshot.lifecycleReadError.message}`
                             : snapshot
                               ? "No verified receipts found for this transaction."
                               : "Load a transaction to inspect its chain receipts."}
